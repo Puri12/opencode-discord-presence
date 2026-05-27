@@ -1,24 +1,71 @@
 import { Client } from "@xhayper/discord-rpc"
-import type { SetActivity } from "../types/index.js"
+import type { PresenceSnapshot } from "../state/presence-state.js"
+import type { Language, RichPresenceOptions, SetActivity } from "../types/index.js"
+import { getActivity } from "../utils/activity-rotation.js"
 
 const RECONNECT_DELAY = 5000
 const MAX_RETRIES = 10
+const DEBOUNCE_MS = 100
+const MAX_DETAILS_LENGTH = 126
+const MAX_STATE_LENGTH = 126
+
+export function createRecapCleanupTask(
+  rpc: DiscordRPCService | null,
+  clearRecapState: () => void,
+): () => Promise<void> {
+  return async () => {
+    clearRecapState()
+    if (!rpc) return
+    await rpc.clear()
+    await rpc.disconnect()
+  }
+}
+
+function truncate(str: string, maxLen: number): string {
+  if (str.length <= maxLen) return str
+  return `${str.slice(0, maxLen - 1)}…`
+}
+
+export { MAX_RETRIES }
 
 export interface DiscordRPCOptions {
   debug?: boolean
 }
 
+/**
+ * DiscordRPCService — hardened Discord Rich Presence client.
+ *
+ * Logging is silent by default. Pass `{ debug: true }` to surface
+ * `[discord-presence]` lifecycle messages via `console.log` / `console.warn`.
+ *
+ * Test injection points (prefixed with _):
+ *   _setConnected(connected)  — override internal connected flag
+ *   _overrideClient(client)    — replace the RPC client for unit tests
+ *   _setTimerImpl(set, clear) — inject fake timers for debounce/reconnect tests
+ *   _getState()                — returns current internal state snapshot
+ */
 export class DiscordRPCService {
   private client: Client | null = null
   private connected = false
   private retryCount = 0
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private sessionStart: Date = new Date()
   private currentPresence: SetActivity | null = null
-  private updateSeq = 0
-  private appliedSeq = 0
-  private shuttingDown = false
   private readonly debug: boolean
+
+  // ── Lifecycle flags ─────────────────────────────────────────────────────
+  private cleared = false
+  private disconnecting = false
+
+  // ── Debounce state ──────────────────────────────────────────────────────
+  private pendingUpdate: SetActivity | null = null
+  private debounceTimer: ReturnType<typeof setTimeout> | null = null
+
+  // ── Reconnect timer ─────────────────────────────────────────────────────
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+
+  // ── Timer injection (for testing) ───────────────────────────────────────
+  private _setTimeoutImpl: typeof setTimeout = setTimeout
+  private _clearTimeoutImpl: typeof clearTimeout = clearTimeout
 
   constructor(
     private clientId: string,
@@ -26,6 +73,35 @@ export class DiscordRPCService {
   ) {
     this.debug = options.debug ?? false
   }
+
+  // ─── Test injection points ────────────────────────────────────────────
+
+  _setConnected(connected: boolean) {
+    this.connected = connected
+  }
+
+  _overrideClient(client: Client) {
+    this.client = client
+  }
+
+  _setTimerImpl(setTimeoutImpl: typeof setTimeout, clearTimeoutImpl: typeof clearTimeout) {
+    this._setTimeoutImpl = setTimeoutImpl
+    this._clearTimeoutImpl = clearTimeoutImpl
+  }
+
+  _getState() {
+    return {
+      connected: this.connected,
+      cleared: this.cleared,
+      disconnecting: this.disconnecting,
+      retryCount: this.retryCount,
+      hasPendingUpdate: this.pendingUpdate !== null,
+      hasDebounceTimer: this.debounceTimer !== null,
+      hasCurrentPresence: this.currentPresence !== null,
+    }
+  }
+
+  // ─── Connection ───────────────────────────────────────────────────────
 
   async connect(): Promise<boolean> {
     if (this.connected) return true
@@ -39,8 +115,10 @@ export class DiscordRPCService {
           this.retryCount = 0
           this.log("Connected to Discord")
 
-          if (this.currentPresence) {
-            this.client?.user?.setActivity(this.currentPresence).catch(() => {})
+          if (this.currentPresence && !this.cleared) {
+            this.client?.user?.setActivity(this.currentPresence).catch((err) => {
+              this.warn("Failed to replay presence:", err)
+            })
           }
 
           resolve(true)
@@ -48,7 +126,7 @@ export class DiscordRPCService {
 
         this.client.on("disconnected", () => {
           this.connected = false
-          if (this.shuttingDown) return
+          if (this.disconnecting) return
           this.log("Disconnected")
           this.scheduleReconnect()
         })
@@ -66,58 +144,147 @@ export class DiscordRPCService {
     })
   }
 
+  /**
+   * Explicitly disconnects and prevents any further reconnect attempts.
+   * Clears all connection state and pending updates.
+   */
   async disconnect(): Promise<void> {
-    this.shuttingDown = true
+    if (this.disconnecting && !this.client) {
+      return
+    }
+
+    this.disconnecting = true
+    this.connected = false
+    this.retryCount = 0
+    this.cleared = true
+
+    if (this.debounceTimer) {
+      this._clearTimeoutImpl(this.debounceTimer)
+      this.debounceTimer = null
+    }
     if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer)
+      this._clearTimeoutImpl(this.reconnectTimer)
       this.reconnectTimer = null
     }
-    this.retryCount = MAX_RETRIES
+    this.pendingUpdate = null
     this.currentPresence = null
-    if (this.client) {
+
+    const client = this.client
+    this.client = null
+
+    if (client?.destroy) {
       try {
-        await this.client.destroy()
-      } catch {}
-      this.client = null
+        await client.destroy()
+      } catch (error) {
+        this.warn("Failed to destroy RPC client:", error)
+      }
     }
-    this.connected = false
   }
 
-  async setPresence(details: string, state?: string) {
-    const seq = ++this.updateSeq
+  private scheduleReconnect() {
+    if (this.disconnecting) return
+    if (this.retryCount >= MAX_RETRIES) {
+      this.log("Max retries reached — not scheduling further reconnects")
+      return
+    }
+    this.retryCount++
+    if (this.reconnectTimer) {
+      this._clearTimeoutImpl(this.reconnectTimer)
+    }
+    this.reconnectTimer = this._setTimeoutImpl(() => {
+      this.reconnectTimer = null
+      this.connect()
+    }, RECONNECT_DELAY)
+    this.reconnectTimer.unref?.()
+  }
+
+  // ─── Presence updates (debounced) ─────────────────────────────────────
+
+  async setPresence(
+    details: string,
+    state?: string,
+    assets?: {
+      largeImageKey?: string
+      largeImageText?: string
+      smallImageKey?: string
+      smallImageText?: string
+    },
+  ): Promise<void> {
     const activity: SetActivity = {
       details,
       state,
       startTimestamp: this.sessionStart,
-      largeImageKey: "opencode-logo",
-      largeImageText: "OpenCode",
+      largeImageKey: assets?.largeImageKey ?? "opencode-logo",
+      largeImageText: assets?.largeImageText ?? "OpenCode",
+      smallImageKey: assets?.smallImageKey,
+      smallImageText: assets?.smallImageText,
     }
 
     this.currentPresence = activity
+    this.cleared = false
 
-    if (!this.connected || !this.client?.user) {
-      return
-    }
+    this.scheduleUpdate(activity)
+  }
 
-    if (seq < this.appliedSeq) return
+  private scheduleUpdate(activity: SetActivity) {
+    this.pendingUpdate = activity
+    if (this.debounceTimer) return
+
+    this.debounceTimer = this._setTimeoutImpl(() => {
+      this.debounceTimer = null
+      this.flushPendingUpdate()
+    }, DEBOUNCE_MS)
+    this.debounceTimer.unref?.()
+  }
+
+  private flushPendingUpdate() {
+    if (!this.pendingUpdate) return
+    if (!this.connected || !this.client?.user) return
+
+    const activity = this.pendingUpdate
+    this.pendingUpdate = null
 
     try {
-      await this.client.user.setActivity(activity)
-      if (seq > this.appliedSeq) this.appliedSeq = seq
+      this.client.user.setActivity(activity).catch((err) => {
+        this.warn("Failed to update:", err)
+      })
     } catch (error) {
       this.warn("Failed to update:", error)
     }
   }
 
-  async clear() {
-    const seq = ++this.updateSeq
+  async setPresenceFromSnapshot(
+    snapshot: PresenceSnapshot,
+    opts: RichPresenceOptions,
+    rotationIndex: number,
+    language: Language = "en",
+  ): Promise<void> {
+    const activity = getActivity(snapshot, opts, rotationIndex, language)
+    await this.setPresence(
+      truncate(activity.details, MAX_DETAILS_LENGTH),
+      activity.state ? truncate(activity.state, MAX_STATE_LENGTH) : undefined,
+      activity.assets,
+    )
+  }
+
+  // ─── Clear ────────────────────────────────────────────────────────────
+
+  async clear(): Promise<void> {
+    this.cleared = true
     this.currentPresence = null
+
+    if (this.debounceTimer) {
+      this._clearTimeoutImpl(this.debounceTimer)
+      this.debounceTimer = null
+    }
+    this.pendingUpdate = null
+
     if (!this.connected || !this.client?.user) return
-    if (seq < this.appliedSeq) return
     try {
       await this.client.user.clearActivity()
-      if (seq > this.appliedSeq) this.appliedSeq = seq
-    } catch {}
+    } catch (error) {
+      this.warn("Failed to clear activity:", error)
+    }
   }
 
   resetSessionStart(): void {
@@ -126,17 +293,6 @@ export class DiscordRPCService {
 
   isConnected(): boolean {
     return this.connected
-  }
-
-  private scheduleReconnect() {
-    if (this.retryCount >= MAX_RETRIES) {
-      this.log("Max retries reached")
-      return
-    }
-    this.retryCount++
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
-    this.reconnectTimer = setTimeout(() => this.connect(), RECONNECT_DELAY)
-    this.reconnectTimer.unref?.()
   }
 
   private log(message: string, ...args: unknown[]): void {

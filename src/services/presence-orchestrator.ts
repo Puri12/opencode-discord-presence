@@ -1,40 +1,64 @@
-import type { Plugin } from "@opencode-ai/plugin"
-import type { Language } from "../types/index.js"
-import { getObjectParticle, getTopicParticle } from "../utils/particle.js"
-import type { DiscordRPCService } from "./discord-rpc.js"
-
-type OpencodeEvent = Parameters<NonNullable<Awaited<ReturnType<Plugin>>["event"]>>[0]["event"]
-type ChatMessageInput = Parameters<NonNullable<Awaited<ReturnType<Plugin>>["chat.message"]>>[0]
-
-export interface PresenceDeps {
-  rpc: DiscordRPCService
-  language: Language
+/**
+ * Result of a busy/idle transition that the plugin layer needs to apply to
+ * the reducer + rotation engine. Returning structured deltas instead of
+ * pushing presence directly keeps the orchestrator render-free and testable.
+ */
+export interface BusyTransition {
+  wasIdle: boolean
+  lastAgent: string
+  lastModel: string
 }
 
-function getPresenceDetails(agent: string, language: Language, idle: boolean): string {
-  if (language === "ko") {
-    return idle
-      ? `${agent}${getTopicParticle(agent)} 휴식중`
-      : `${agent}${getObjectParticle(agent)} 갈구는중`
-  }
-  return idle ? `${agent} is idle` : `Working with ${agent}`
+export interface IdleTransition {
+  nowAllIdle: boolean
+  lastAgent: string
+  lastModel: string
 }
 
 /**
- * Tracks the latest active agent (main or sub-agent) and pushes it to Discord.
- * Every chat.message overwrites the presence; the last agent to speak wins.
- * Idle text appears only when every tracked session reports idle.
+ * Tracks which sessions are currently busy so the plugin can decide when to
+ * push idle text vs active presence. Does NOT touch the Discord RPC client —
+ * the plugin layer owns rendering via the reducer + setPresenceFromSnapshot.
+ *
+ * Behaviour:
+ *   - `markBusy(sessionID, agent?, model?)` adds the session to the busy set
+ *     and records last-writer-wins identity. Returns whether we were idle
+ *     before (so the caller can resetSessionStart) and the identity to render.
+ *   - `markIdle(sessionID)` removes the session and reports whether the
+ *     ENTIRE process is now idle (no other busy sessions). Idle text should
+ *     only be pushed when nowAllIdle is true.
+ *   - When the same sessionID flips busy → idle → busy, the orchestrator is
+ *     idempotent and only the LAST writer's agent is retained.
  */
 export class PresenceOrchestrator {
-  private readonly rpc: DiscordRPCService
-  private readonly language: Language
+  private readonly busySessions = new Set<string>()
   private lastAgent = ""
   private lastModel = ""
-  private readonly busySessions = new Set<string>()
 
-  constructor(deps: PresenceDeps) {
-    this.rpc = deps.rpc
-    this.language = deps.language
+  markBusy(sessionID: string, agent?: string, model?: string): BusyTransition {
+    const wasIdle = this.busySessions.size === 0
+    if (sessionID) this.busySessions.add(sessionID)
+    if (agent) this.lastAgent = agent
+    if (model !== undefined) this.lastModel = model
+    return {
+      wasIdle,
+      lastAgent: this.lastAgent,
+      lastModel: this.lastModel,
+    }
+  }
+
+  markIdle(sessionID: string): IdleTransition {
+    const had = sessionID ? this.busySessions.delete(sessionID) : false
+    const nowAllIdle = had && this.busySessions.size === 0
+    return {
+      nowAllIdle,
+      lastAgent: this.lastAgent,
+      lastModel: this.lastModel,
+    }
+  }
+
+  isBusy(): boolean {
+    return this.busySessions.size > 0
   }
 
   getBusyCount(): number {
@@ -45,66 +69,13 @@ export class PresenceOrchestrator {
     return this.lastAgent
   }
 
-  async onChatMessage(input: ChatMessageInput): Promise<void> {
-    if (!input.sessionID) return
-    const agent = input.agent || this.lastAgent || "OpenCode"
-    const modelID = input.model?.modelID ?? this.lastModel ?? ""
-    await this.onBusy(input.sessionID, agent, modelID)
+  getLastModel(): string {
+    return this.lastModel
   }
 
-  async onEvent(event: OpencodeEvent): Promise<void> {
-    if (event.type === "session.deleted") {
-      await this.onIdle(event.properties.info.id)
-      return
-    }
-    if (event.type === "session.status") {
-      const status = event.properties.status.type
-      if (status === "idle") {
-        await this.onIdle(event.properties.sessionID)
-      } else if (status === "busy") {
-        await this.onBusy(event.properties.sessionID, this.lastAgent || "OpenCode", this.lastModel)
-      }
-      return
-    }
-    if (event.type === "session.idle") {
-      await this.onIdle(event.properties.sessionID)
-    }
-  }
-
-  async shutdown(): Promise<void> {
+  reset(): void {
     this.busySessions.clear()
-    await this.rpc.disconnect()
-  }
-
-  private async onBusy(sessionID: string, agent: string, modelID: string): Promise<void> {
-    const wasIdle = this.busySessions.size === 0
-    this.busySessions.add(sessionID)
-    this.lastAgent = agent
-    this.lastModel = modelID
-
-    await this.ensureConnected()
-    if (wasIdle) this.rpc.resetSessionStart()
-    await this.rpc.setPresence(
-      getPresenceDetails(agent, this.language, false),
-      modelID || undefined,
-    )
-  }
-
-  private async onIdle(sessionID: string): Promise<void> {
-    this.busySessions.delete(sessionID)
-    if (this.busySessions.size > 0) return
-    if (!this.lastAgent) return
-    await this.ensureConnected()
-    await this.rpc.setPresence(
-      getPresenceDetails(this.lastAgent, this.language, true),
-      this.lastModel || undefined,
-    )
-  }
-
-  private async ensureConnected(): Promise<void> {
-    if (this.rpc.isConnected()) return
-    await this.rpc.connect()
+    this.lastAgent = ""
+    this.lastModel = ""
   }
 }
-
-export type { ChatMessageInput, OpencodeEvent }

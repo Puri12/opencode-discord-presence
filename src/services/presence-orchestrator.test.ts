@@ -1,220 +1,110 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test"
-import type { DiscordRPCService } from "./discord-rpc"
-import { type OpencodeEvent, PresenceOrchestrator } from "./presence-orchestrator"
-
-interface FakeRPC {
-  setPresence: ReturnType<typeof mock>
-  clear: ReturnType<typeof mock>
-  connect: ReturnType<typeof mock>
-  disconnect: ReturnType<typeof mock>
-  isConnected: ReturnType<typeof mock>
-  resetSessionStart: ReturnType<typeof mock>
-}
-
-function makeRPC(): FakeRPC {
-  let isConn = false
-  return {
-    setPresence: mock(async () => {}),
-    clear: mock(async () => {}),
-    connect: mock(async () => {
-      isConn = true
-      return true
-    }),
-    disconnect: mock(async () => {
-      isConn = false
-    }),
-    isConnected: mock(() => isConn),
-    resetSessionStart: mock(() => {}),
-  }
-}
+import { describe, expect, test } from "bun:test"
+import { PresenceOrchestrator } from "./presence-orchestrator"
 
 describe("PresenceOrchestrator", () => {
-  let rpc: FakeRPC
-
-  beforeEach(() => {
-    rpc = makeRPC()
+  test("markBusy from a fresh state reports wasIdle=true and records identity", () => {
+    const o = new PresenceOrchestrator()
+    const result = o.markBusy("ses_main", "Prometheus", "claude-sonnet-4")
+    expect(result.wasIdle).toBe(true)
+    expect(result.lastAgent).toBe("Prometheus")
+    expect(result.lastModel).toBe("claude-sonnet-4")
+    expect(o.isBusy()).toBe(true)
+    expect(o.getBusyCount()).toBe(1)
   })
 
-  test("chat.message from any session sets busy presence", async () => {
-    const o = new PresenceOrchestrator({
-      rpc: rpc as unknown as DiscordRPCService,
-      language: "en",
-    })
-    await o.onChatMessage({
-      sessionID: "ses_main",
-      agent: "Prometheus",
-      model: { providerID: "anthropic", modelID: "claude-sonnet-4" },
-    })
-    expect(rpc.setPresence.mock.calls.length).toBe(1)
-    expect(rpc.setPresence.mock.calls[0][0]).toBe("Working with Prometheus")
-    expect(rpc.setPresence.mock.calls[0][1]).toBe("claude-sonnet-4")
-  })
-
-  test("sub-agent chat.message overwrites previous presence (last writer wins)", async () => {
-    const o = new PresenceOrchestrator({
-      rpc: rpc as unknown as DiscordRPCService,
-      language: "en",
-    })
-    await o.onChatMessage({
-      sessionID: "ses_main",
-      agent: "Prometheus",
-      model: { providerID: "anthropic", modelID: "claude-sonnet-4" },
-    })
-    await o.onChatMessage({
-      sessionID: "ses_sub",
-      agent: "planner",
-      model: { providerID: "anthropic", modelID: "claude-haiku-4" },
-    })
-    expect(rpc.setPresence.mock.calls.length).toBe(2)
-    expect(rpc.setPresence.mock.calls[0][0]).toBe("Working with Prometheus")
-    expect(rpc.setPresence.mock.calls[1][0]).toBe("Working with planner")
-    expect(o.getLastAgent()).toBe("planner")
+  test("second markBusy on different session reports wasIdle=false", () => {
+    const o = new PresenceOrchestrator()
+    o.markBusy("ses_a", "A")
+    const second = o.markBusy("ses_b", "B")
+    expect(second.wasIdle).toBe(false)
+    expect(second.lastAgent).toBe("B")
     expect(o.getBusyCount()).toBe(2)
   })
 
-  test("Korean busy uses object particle", async () => {
-    const o = new PresenceOrchestrator({
-      rpc: rpc as unknown as DiscordRPCService,
-      language: "ko",
-    })
-    await o.onChatMessage({ sessionID: "ses_m", agent: "Prometheus", model: undefined })
-    expect(rpc.setPresence.mock.calls[0][0]).toBe("Prometheus를 갈구는중")
+  test("sub-agent markBusy overwrites lastAgent (last writer wins)", () => {
+    const o = new PresenceOrchestrator()
+    o.markBusy("ses_main", "Prometheus", "claude-sonnet-4")
+    o.markBusy("ses_sub", "planner", "claude-haiku-4")
+    expect(o.getLastAgent()).toBe("planner")
+    expect(o.getLastModel()).toBe("claude-haiku-4")
+    expect(o.getBusyCount()).toBe(2)
   })
 
-  test("session.idle while ANOTHER session still busy keeps busy presence", async () => {
-    const o = new PresenceOrchestrator({
-      rpc: rpc as unknown as DiscordRPCService,
-      language: "en",
-    })
-    await o.onChatMessage({ sessionID: "ses_a", agent: "A", model: undefined })
-    await o.onChatMessage({ sessionID: "ses_b", agent: "B", model: undefined })
-    rpc.setPresence.mockClear()
-    await o.onEvent({
-      type: "session.idle",
-      properties: { sessionID: "ses_a" },
-    } as OpencodeEvent)
-    expect(rpc.setPresence.mock.calls.length).toBe(0)
+  test("markBusy without agent preserves existing lastAgent (status:busy keep-alive)", () => {
+    const o = new PresenceOrchestrator()
+    o.markBusy("ses_main", "Prometheus", "claude-sonnet-4")
+    const result = o.markBusy("ses_main")
+    expect(result.lastAgent).toBe("Prometheus")
+    expect(result.lastModel).toBe("claude-sonnet-4")
+  })
+
+  test("markBusy with empty model string sets model (explicit clear)", () => {
+    const o = new PresenceOrchestrator()
+    o.markBusy("ses_main", "Prometheus", "claude-sonnet-4")
+    o.markBusy("ses_main", "Prometheus", "")
+    expect(o.getLastModel()).toBe("")
+  })
+
+  test("markIdle while another session still busy reports nowAllIdle=false", () => {
+    const o = new PresenceOrchestrator()
+    o.markBusy("ses_a", "A")
+    o.markBusy("ses_b", "B")
+    const result = o.markIdle("ses_a")
+    expect(result.nowAllIdle).toBe(false)
     expect(o.getBusyCount()).toBe(1)
   })
 
-  test("session.idle for the last busy session shows idle text with last agent", async () => {
-    const o = new PresenceOrchestrator({
-      rpc: rpc as unknown as DiscordRPCService,
-      language: "en",
-    })
-    await o.onChatMessage({ sessionID: "ses_main", agent: "Prometheus", model: undefined })
-    await o.onChatMessage({ sessionID: "ses_sub", agent: "planner", model: undefined })
-    await o.onEvent({
-      type: "session.idle",
-      properties: { sessionID: "ses_sub" },
-    } as OpencodeEvent)
-    expect(rpc.setPresence.mock.calls.length).toBe(2)
-    await o.onEvent({
-      type: "session.idle",
-      properties: { sessionID: "ses_main" },
-    } as OpencodeEvent)
-    expect(rpc.setPresence.mock.calls.length).toBe(3)
-    expect(rpc.setPresence.mock.calls[2][0]).toBe("planner is idle")
+  test("markIdle on the last busy session reports nowAllIdle=true with lastAgent retained", () => {
+    const o = new PresenceOrchestrator()
+    o.markBusy("ses_main", "Prometheus")
+    o.markBusy("ses_sub", "planner")
+    o.markIdle("ses_main")
+    const result = o.markIdle("ses_sub")
+    expect(result.nowAllIdle).toBe(true)
+    expect(result.lastAgent).toBe("planner")
+    expect(o.isBusy()).toBe(false)
   })
 
-  test("Korean idle uses topic particle", async () => {
-    const o = new PresenceOrchestrator({
-      rpc: rpc as unknown as DiscordRPCService,
-      language: "ko",
-    })
-    await o.onChatMessage({ sessionID: "ses_m", agent: "Prometheus", model: undefined })
-    await o.onEvent({
-      type: "session.idle",
-      properties: { sessionID: "ses_m" },
-    } as OpencodeEvent)
-    expect(rpc.setPresence.mock.calls[1][0]).toBe("Prometheus는 휴식중")
+  test("markIdle for unknown session is no-op (nowAllIdle=false even when empty)", () => {
+    const o = new PresenceOrchestrator()
+    const result = o.markIdle("ses_never_busy")
+    expect(result.nowAllIdle).toBe(false)
   })
 
-  test("session.status idle on last busy → idle text", async () => {
-    const o = new PresenceOrchestrator({
-      rpc: rpc as unknown as DiscordRPCService,
-      language: "en",
-    })
-    await o.onChatMessage({ sessionID: "ses_m", agent: "Claude", model: undefined })
-    await o.onEvent({
-      type: "session.status",
-      properties: { sessionID: "ses_m", status: { type: "idle" } },
-    } as OpencodeEvent)
-    expect(rpc.setPresence.mock.calls.length).toBe(2)
-    expect(rpc.setPresence.mock.calls[1][0]).toBe("Claude is idle")
+  test("markIdle followed by markBusy for same session restarts cycle", () => {
+    const o = new PresenceOrchestrator()
+    o.markBusy("ses_main", "A")
+    o.markIdle("ses_main")
+    const result = o.markBusy("ses_main", "B")
+    expect(result.wasIdle).toBe(true)
+    expect(result.lastAgent).toBe("B")
   })
 
-  test("session.status retry is a no-op", async () => {
-    const o = new PresenceOrchestrator({
-      rpc: rpc as unknown as DiscordRPCService,
-      language: "en",
-    })
-    await o.onChatMessage({ sessionID: "ses_m", agent: "Claude", model: undefined })
-    rpc.setPresence.mockClear()
-    await o.onEvent({
-      type: "session.status",
-      properties: { sessionID: "ses_m", status: { type: "retry" } as never },
-    } as OpencodeEvent)
-    expect(rpc.setPresence.mock.calls.length).toBe(0)
-  })
-
-  test("idle without any prior busy is no-op (nothing to display)", async () => {
-    const o = new PresenceOrchestrator({
-      rpc: rpc as unknown as DiscordRPCService,
-      language: "en",
-    })
-    await o.onEvent({
-      type: "session.idle",
-      properties: { sessionID: "ses_m" },
-    } as OpencodeEvent)
-    expect(rpc.setPresence.mock.calls.length).toBe(0)
-  })
-
-  test("session.deleted removes session from busy set", async () => {
-    const o = new PresenceOrchestrator({
-      rpc: rpc as unknown as DiscordRPCService,
-      language: "en",
-    })
-    await o.onChatMessage({ sessionID: "ses_m", agent: "A", model: undefined })
-    expect(o.getBusyCount()).toBe(1)
-    await o.onEvent({
-      type: "session.deleted",
-      properties: { info: { id: "ses_m" } as never },
-    } as OpencodeEvent)
+  test("empty sessionID is ignored", () => {
+    const o = new PresenceOrchestrator()
+    o.markBusy("", "Ghost")
     expect(o.getBusyCount()).toBe(0)
-    expect(rpc.setPresence.mock.calls[1][0]).toBe("A is idle")
+    expect(o.getLastAgent()).toBe("Ghost")
+    const idleResult = o.markIdle("")
+    expect(idleResult.nowAllIdle).toBe(false)
   })
 
-  test("two windows sharing RPC overwrite each other (no lock gating)", async () => {
-    const sharedRpc = makeRPC()
-    const a = new PresenceOrchestrator({
-      rpc: sharedRpc as unknown as DiscordRPCService,
-      language: "en",
-    })
-    const b = new PresenceOrchestrator({
-      rpc: sharedRpc as unknown as DiscordRPCService,
-      language: "en",
-    })
-    await a.onChatMessage({ sessionID: "ses_a", agent: "A", model: undefined })
-    await b.onChatMessage({ sessionID: "ses_b", agent: "B", model: undefined })
-    expect(sharedRpc.setPresence.mock.calls.length).toBe(2)
-    expect(sharedRpc.setPresence.mock.calls[0][0]).toBe("Working with A")
-    expect(sharedRpc.setPresence.mock.calls[1][0]).toBe("Working with B")
+  test("reset clears all state", () => {
+    const o = new PresenceOrchestrator()
+    o.markBusy("ses_a", "A", "m")
+    o.markBusy("ses_b", "B", "m")
+    o.reset()
+    expect(o.getBusyCount()).toBe(0)
+    expect(o.getLastAgent()).toBe("")
+    expect(o.getLastModel()).toBe("")
   })
 
-  test("rapid main → sub → main updates each overwrite", async () => {
-    const o = new PresenceOrchestrator({
-      rpc: rpc as unknown as DiscordRPCService,
-      language: "en",
-    })
-    await o.onChatMessage({ sessionID: "ses_main", agent: "Sisyphus", model: undefined })
-    await o.onChatMessage({ sessionID: "ses_sub", agent: "explore", model: undefined })
-    await o.onChatMessage({ sessionID: "ses_main", agent: "Sisyphus", model: undefined })
-    expect(rpc.setPresence.mock.calls.map((c) => c[0])).toEqual([
-      "Working with Sisyphus",
-      "Working with explore",
-      "Working with Sisyphus",
-    ])
+  test("rapid main → sub → main keeps the last writer", () => {
+    const o = new PresenceOrchestrator()
+    o.markBusy("ses_main", "Sisyphus")
+    o.markBusy("ses_sub", "explore")
+    o.markBusy("ses_main", "Sisyphus")
     expect(o.getLastAgent()).toBe("Sisyphus")
+    expect(o.getBusyCount()).toBe(2)
   })
 })

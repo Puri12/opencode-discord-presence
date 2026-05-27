@@ -1,0 +1,14 @@
+{
+  "enabled": true,
+  "language": "ko",
+  "debug": true,
+  "richPresence": {
+    "enableFileSpotlight": true,
+    "enableMissionBoard": true,
+    "rotationIntervalSeconds": 20,
+    "mainAgentOnly": false,
+    "diagnostics": {
+      "errorsOnly": true
+    }
+  }
+}

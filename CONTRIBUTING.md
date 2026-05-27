@@ -14,7 +14,7 @@ Thank you for your interest in contributing! This document provides guidelines a
 
 ```bash
 # Clone the repository
-git clone https://github.com/Puri12/opencode-rich-presence.git
+git clone https://github.com/Puri12/opencode-discord-presence.git
 cd opencode-discord-presence
 
 # Install dependencies
@@ -36,7 +36,7 @@ bun test
 bun test --watch
 
 # Run specific test file
-bun test src/utils/format.test.ts
+bun test src/config.test.ts
 ```
 
 ### Code Quality
@@ -87,6 +87,8 @@ src/
 ```
 
 ## Testing Guidelines
+
+Config compatibility note: new docs and examples should use the top-level `applicationId` key in `.discord-presence.json`. The parser still accepts `discordPresence.applicationId` only for backward compatibility.
 
 ### Test Structure
 
