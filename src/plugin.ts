@@ -1,5 +1,6 @@
 import { homedir } from "node:os"
 import { join } from "node:path"
+import { readFile } from "node:fs/promises"
 import type { Plugin } from "@opencode-ai/plugin"
 import { getConfig } from "./config.js"
 import { createRecapCleanupTask, DiscordRPCService } from "./services/discord-rpc.js"
@@ -39,13 +40,11 @@ async function loadConfigFile(directory: string): Promise<DiscordPresenceOptions
   ]
 
   for (const configPath of paths) {
-    const file = Bun.file(configPath)
-    if (await file.exists()) {
-      try {
-        return (await file.json()) as DiscordPresenceOptions
-      } catch (error) {
-        console.warn("[discord-presence] Failed to load config file:", error)
-      }
+    try {
+      const content = await readFile(configPath, "utf-8")
+      return JSON.parse(content) as DiscordPresenceOptions
+    } catch (error) {
+      console.warn("[discord-presence] Failed to load config file:", error)
     }
   }
   return undefined
