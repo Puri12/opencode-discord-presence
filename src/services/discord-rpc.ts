@@ -146,7 +146,8 @@ export class DiscordRPCService {
 
   /**
    * Explicitly disconnects and prevents any further reconnect attempts.
-   * Clears all connection state and pending updates.
+   * Clears the Discord activity first so the presence disappears immediately,
+   * then tears down the WebSocket connection.
    */
   async disconnect(): Promise<void> {
     if (this.disconnecting && !this.client) {
@@ -169,8 +170,19 @@ export class DiscordRPCService {
     this.pendingUpdate = null
     this.currentPresence = null
 
+    // Clear the Discord activity before destroying the client.
+    // Discord does not auto-expire RPC states — without this the last
+    // presence would stay visible forever after an unclean shutdown.
     const client = this.client
     this.client = null
+
+    if (client?.user) {
+      try {
+        await client.user.clearActivity()
+      } catch (error) {
+        this.warn("Failed to clear activity:", error)
+      }
+    }
 
     if (client?.destroy) {
       try {

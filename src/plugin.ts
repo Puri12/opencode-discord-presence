@@ -268,7 +268,24 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
     startRotationTimer()
   }
 
+  /**
+   * Clears the Discord activity and disconnects the RPC client.
+   * Called on graceful shutdown (dispose hook) and as a signal fallback.
+   */
+  const shutdown = async () => {
+    stopRotationTimer()
+    if (!rpc) return
+    const current = rpc
+    rpc = null
+    await current.clear()
+    await current.disconnect()
+  }
+
+  process.on("SIGINT", () => { void shutdown() })
+  process.on("SIGTERM", () => { void shutdown() })
+
   return {
+    dispose: () => shutdown(),
     // ── chat.message ────────────────────────────────────────────────────────────
     "chat.message": async (input, _output) => {
       const sessionID = (input as { sessionID?: string }).sessionID ?? ""
