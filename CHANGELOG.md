@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-05-28
+
+### Fixed
+
+- **Non-blocking Discord RPC connect on init** ([#3](https://github.com/Puri12/opencode-discord-presence/issues/3), [#4](https://github.com/Puri12/opencode-discord-presence/pull/4)). OpenCode awaits the plugin init promise during bootstrap, so the ~10 s `@xhayper/discord-rpc` IPC timeout used to stall the entire UI whenever Discord desktop was not running. The plugin now starts the rotation timer and queues initial presence immediately, then fires `connect()` fire-and-forget. The existing `'ready'` replay logic in `DiscordRPCService` pushes the cached presence on every successful connect (initial or via `scheduleReconnect()`), so late Discord launches are covered without changing the service API. Extracted as `startPluginAsync` and pinned by a regression test asserting sync return even when `connect()` never resolves.
+
 ## [0.5.0] - 2026-05-27
 
 ### Added
