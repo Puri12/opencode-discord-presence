@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import type { Plugin } from "@opencode-ai/plugin"
@@ -39,13 +40,12 @@ async function loadConfigFile(directory: string): Promise<DiscordPresenceOptions
   ]
 
   for (const configPath of paths) {
-    const file = Bun.file(configPath)
-    if (await file.exists()) {
-      try {
-        return (await file.json()) as DiscordPresenceOptions
-      } catch (error) {
-        console.warn("[discord-presence] Failed to load config file:", error)
-      }
+    try {
+      const content = await readFile(configPath, "utf-8")
+      return JSON.parse(content) as DiscordPresenceOptions
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue
+      console.warn("[discord-presence] Failed to load config file:", error)
     }
   }
   return undefined
@@ -291,7 +291,28 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
 
   startPluginAsync(rpc, pushPresence, startRotationTimer)
 
+  /**
+   * Clears the Discord activity and disconnects the RPC client.
+   * Called on graceful shutdown (dispose hook) and as a signal fallback.
+   */
+  const shutdown = async () => {
+    stopRotationTimer()
+    if (!rpc) return
+    const current = rpc
+    rpc = null
+    await current.clear()
+    await current.disconnect()
+  }
+
+  process.on("SIGINT", () => {
+    void shutdown()
+  })
+  process.on("SIGTERM", () => {
+    void shutdown()
+  })
+
   return {
+    dispose: () => shutdown(),
     // ── chat.message ────────────────────────────────────────────────────────────
     "chat.message": async (input, _output) => {
       const sessionID = (input as { sessionID?: string }).sessionID ?? ""
