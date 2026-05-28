@@ -63,6 +63,14 @@ export class DiscordRPCService {
   private cleared = false
   private disconnecting = false
 
+  // Monotonic counter incremented on every connect() and disconnect(). Each
+  // client's event handlers capture the generation they were registered for
+  // and bail out if it no longer matches — that prevents a stale `ready` (from
+  // an old client we already disconnected) from flipping `connected` back to
+  // true after `this.client = null`, which would leave the service in a
+  // zombie "connected with no client" state where every setActivity is dropped.
+  private clientGeneration = 0
+
   // ── Debounce state ──────────────────────────────────────────────────────
   private pendingUpdate: SetActivity | null = null
   private debounceTimer: ReturnType<typeof setTimeout> | null = null
@@ -108,6 +116,10 @@ export class DiscordRPCService {
     }
   }
 
+  _getClientGeneration(): number {
+    return this.clientGeneration
+  }
+
   // ─── Connection ───────────────────────────────────────────────────────
 
   async connect(): Promise<boolean> {
@@ -122,11 +134,14 @@ export class DiscordRPCService {
     this.disconnecting = false
     this.cleared = false
 
+    const myGeneration = ++this.clientGeneration
+
     return new Promise((resolve) => {
       try {
         this.client = new Client({ clientId: this.clientId })
 
         this.client.on("ready", () => {
+          if (myGeneration !== this.clientGeneration) return
           this.connected = true
           this.retryCount = 0
           this.log("Connected to Discord")
@@ -141,6 +156,7 @@ export class DiscordRPCService {
         })
 
         this.client.on("disconnected", () => {
+          if (myGeneration !== this.clientGeneration) return
           this.connected = false
           if (this.disconnecting) return
           this.log("Disconnected")
@@ -148,6 +164,10 @@ export class DiscordRPCService {
         })
 
         this.client.login().catch((err) => {
+          if (myGeneration !== this.clientGeneration) {
+            resolve(false)
+            return
+          }
           this.log("Connection failed:", err?.message || err)
           this.scheduleReconnect()
           resolve(false)
@@ -173,6 +193,7 @@ export class DiscordRPCService {
     this.connected = false
     this.retryCount = 0
     this.cleared = true
+    this.clientGeneration++
 
     if (this.debounceTimer) {
       this._clearTimeoutImpl(this.debounceTimer)

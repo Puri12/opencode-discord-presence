@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { InstanceCoordinator, type InstanceRecord } from "./instance-coordinator"
@@ -14,8 +14,15 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true })
 })
 
-function writePeer(record: InstanceRecord): void {
-  writeFileSync(join(dir, `${record.pid}.json`), JSON.stringify(record))
+function writePeer(record: Partial<InstanceRecord> & { pid: number }): void {
+  const full: InstanceRecord = {
+    pid: record.pid,
+    instanceId: record.instanceId ?? `peer-${record.pid}`,
+    startedAt: record.startedAt ?? Date.now(),
+    lastActivity: record.lastActivity ?? 0,
+    lastSeen: record.lastSeen ?? Date.now(),
+  }
+  writeFileSync(join(dir, `${full.pid}.json`), JSON.stringify(full))
 }
 
 describe("InstanceCoordinator", () => {
@@ -69,60 +76,80 @@ describe("InstanceCoordinator", () => {
       expect(coord.isOwner()).toBe(true)
     })
 
-    test("tiebreak: equal lastActivity prefers higher startedAt", () => {
+    test("F1: new CLI with default lastActivity does NOT beat an older active peer", () => {
       const now = Date.now()
       writePeer({
         pid: 2000,
-        startedAt: now, // same startedAt
-        lastActivity: now,
+        startedAt: now - 60_000,
+        lastActivity: now - 5_000,
         lastSeen: now,
       })
 
       const coord = new InstanceCoordinator({
         instancesDir: dir,
         pid: 1000,
-        startedAt: now - 1_000, // older
-        lastActivity: now,
-      })
-      coord.tick()
-
-      expect(coord.isOwner()).toBe(false) // peer's startedAt is newer
-    })
-
-    test("tiebreak: equal lastActivity + startedAt prefers higher pid", () => {
-      const now = Date.now()
-      writePeer({
-        pid: 2000,
-        startedAt: now,
-        lastActivity: now,
-        lastSeen: now,
-      })
-
-      const coord = new InstanceCoordinator({
-        instancesDir: dir,
-        pid: 1000, // lower pid → loses
-        startedAt: now,
-        lastActivity: now,
       })
       coord.tick()
 
       expect(coord.isOwner()).toBe(false)
     })
+
+    test("F1: equal lastActivity (sentinel=0) prefers OLDER startedAt", () => {
+      const now = Date.now()
+      writePeer({
+        pid: 2000,
+        startedAt: now,
+        lastActivity: 0,
+        lastSeen: now,
+      })
+
+      const coord = new InstanceCoordinator({
+        instancesDir: dir,
+        pid: 1000,
+        startedAt: now - 5_000,
+        lastActivity: 0,
+      })
+      coord.tick()
+
+      expect(coord.isOwner()).toBe(true)
+    })
+
+    test("F1: equal lastActivity + startedAt prefers LOWER pid (stable+deterministic)", () => {
+      const now = Date.now()
+      writePeer({
+        pid: 2000,
+        startedAt: now,
+        lastActivity: 0,
+        lastSeen: now,
+      })
+
+      const coord = new InstanceCoordinator({
+        instancesDir: dir,
+        pid: 1000,
+        startedAt: now,
+        lastActivity: 0,
+      })
+      coord.tick()
+
+      expect(coord.isOwner()).toBe(true)
+    })
   })
 
   describe("stale cleanup", () => {
     test("stale peers (lastSeen older than threshold) are excluded and unlinked", () => {
+      const now = Date.now()
       writePeer({
         pid: 2000,
-        startedAt: Date.now() - 100_000,
-        lastActivity: Date.now() + 60_000, // would dominate if alive
-        lastSeen: Date.now() - 30_000, // 30 s ago = stale
+        startedAt: now - 100_000,
+        lastActivity: now - 1_000,
+        lastSeen: now - 30_000,
       })
 
       const coord = new InstanceCoordinator({
         instancesDir: dir,
         pid: 1000,
         staleThresholdMs: 10_000,
+        staleGracePeriodTicks: 0,
       })
       coord.tick()
 
@@ -227,6 +254,250 @@ describe("InstanceCoordinator", () => {
 
       expect(() => coord.tick()).not.toThrow()
       expect(coord.isOwner()).toBe(true)
+    })
+  })
+
+  describe("F2: atomic writes", () => {
+    test("own file is always a complete valid JSON record (no partial overwrite)", () => {
+      const coord = new InstanceCoordinator({ instancesDir: dir, pid: 1000 })
+      for (let i = 0; i < 50; i++) {
+        coord.recordActivity()
+        coord.tick()
+        const raw = readFileSync(join(dir, "1000.json"), "utf-8")
+        expect(() => JSON.parse(raw)).not.toThrow()
+      }
+    })
+
+    test("temp files used for atomic write are not treated as peer files", () => {
+      const coord = new InstanceCoordinator({ instancesDir: dir, pid: 1000 })
+      writeFileSync(join(dir, "1234.json.tmp.xyz"), "{ partial")
+      writeFileSync(join(dir, "1234.tmp"), "{ partial")
+
+      expect(() => coord.tick()).not.toThrow()
+      expect(coord.isOwner()).toBe(true)
+    })
+  })
+
+  describe("F4: write-failure forces non-owner (fail-closed)", () => {
+    test("when writeOwnFile fails, instance demotes itself and notifies listeners", () => {
+      const readOnlyDir = mkdtempSync(join(tmpdir(), "instance-coord-ro-"))
+      try {
+        const coord = new InstanceCoordinator({ instancesDir: readOnlyDir, pid: 1000 })
+        const events: boolean[] = []
+        coord.onOwnershipChange((isOwner) => events.push(isOwner))
+
+        rmSync(readOnlyDir, { recursive: true, force: true })
+
+        coord.tick()
+
+        expect(coord.isOwner()).toBe(false)
+        expect(events).toEqual([false])
+      } finally {
+        rmSync(readOnlyDir, { recursive: true, force: true })
+      }
+    })
+  })
+
+  describe("F5: instanceId guard prevents cross-reload deletion", () => {
+    test("stop() does not delete a file rewritten by a different instanceId", () => {
+      const coord1 = new InstanceCoordinator({
+        instancesDir: dir,
+        pid: 1000,
+        instanceId: "first",
+      })
+      expect(readdirSync(dir)).toContain("1000.json")
+
+      const coord2 = new InstanceCoordinator({
+        instancesDir: dir,
+        pid: 1000,
+        instanceId: "second",
+      })
+      expect(readdirSync(dir)).toContain("1000.json")
+
+      coord1.stop()
+
+      expect(readdirSync(dir)).toContain("1000.json")
+      const raw = readFileSync(join(dir, "1000.json"), "utf-8")
+      const record = JSON.parse(raw) as InstanceRecord
+      expect(record.instanceId).toBe("second")
+
+      coord2.stop()
+      expect(readdirSync(dir)).not.toContain("1000.json")
+    })
+
+    test("own record always includes its instanceId", () => {
+      const coord = new InstanceCoordinator({
+        instancesDir: dir,
+        pid: 1000,
+        instanceId: "abc-123",
+      })
+      coord.tick()
+      const record = JSON.parse(readFileSync(join(dir, "1000.json"), "utf-8")) as InstanceRecord
+      expect(record.instanceId).toBe("abc-123")
+    })
+
+    test("auto-generated instanceId is unique per coordinator", () => {
+      const a = new InstanceCoordinator({ instancesDir: dir, pid: 1000 })
+      const b = new InstanceCoordinator({ instancesDir: dir, pid: 1001 })
+      const ra = JSON.parse(readFileSync(join(dir, "1000.json"), "utf-8")) as InstanceRecord
+      const rb = JSON.parse(readFileSync(join(dir, "1001.json"), "utf-8")) as InstanceRecord
+      expect(ra.instanceId).toBeDefined()
+      expect(rb.instanceId).toBeDefined()
+      expect(ra.instanceId).not.toBe(rb.instanceId)
+      a.stop()
+      b.stop()
+    })
+  })
+
+  describe("F7: peer schema validation rejects bogus records", () => {
+    test("peer with lastActivity far in the future is ignored", () => {
+      const now = Date.now()
+      writePeer({
+        pid: 2000,
+        startedAt: now,
+        lastActivity: now + 24 * 60 * 60 * 1000,
+        lastSeen: now,
+      })
+
+      const coord = new InstanceCoordinator({
+        instancesDir: dir,
+        pid: 1000,
+        allowedClockSkewMs: 60_000,
+      })
+      coord.recordActivity()
+      coord.tick()
+
+      expect(coord.isOwner()).toBe(true)
+    })
+
+    test("peer with non-finite numeric fields is ignored", () => {
+      writeFileSync(
+        join(dir, "2000.json"),
+        JSON.stringify({
+          pid: 2000,
+          instanceId: "x",
+          startedAt: "not-a-number",
+          lastActivity: Number.POSITIVE_INFINITY,
+          lastSeen: null,
+        }),
+      )
+
+      const coord = new InstanceCoordinator({ instancesDir: dir, pid: 1000 })
+
+      expect(() => coord.tick()).not.toThrow()
+      expect(coord.isOwner()).toBe(true)
+    })
+
+    test("peer with negative timestamps is ignored", () => {
+      writeFileSync(
+        join(dir, "2000.json"),
+        JSON.stringify({
+          pid: 2000,
+          instanceId: "x",
+          startedAt: -1,
+          lastActivity: -1,
+          lastSeen: -1,
+        }),
+      )
+
+      const coord = new InstanceCoordinator({ instancesDir: dir, pid: 1000 })
+      expect(() => coord.tick()).not.toThrow()
+      expect(coord.isOwner()).toBe(true)
+    })
+  })
+
+  describe("F12: recordActivity flush triggers immediate ownership re-evaluation", () => {
+    test("recordActivity({ flush: true }) flips ownership in the same call", () => {
+      const now = Date.now()
+      writePeer({
+        pid: 2000,
+        startedAt: now - 10_000,
+        lastActivity: now - 5_000,
+        lastSeen: now,
+      })
+
+      const coord = new InstanceCoordinator({
+        instancesDir: dir,
+        pid: 1000,
+      })
+      coord.tick()
+      expect(coord.isOwner()).toBe(false)
+
+      coord.recordActivity({ flush: true })
+
+      expect(coord.isOwner()).toBe(true)
+    })
+
+    test("recordActivity() without flush leaves ownership state to next tick", () => {
+      const now = Date.now()
+      writePeer({
+        pid: 2000,
+        startedAt: now - 10_000,
+        lastActivity: now - 5_000,
+        lastSeen: now,
+      })
+
+      const coord = new InstanceCoordinator({
+        instancesDir: dir,
+        pid: 1000,
+      })
+      coord.tick()
+      expect(coord.isOwner()).toBe(false)
+
+      coord.recordActivity()
+      expect(coord.isOwner()).toBe(false)
+
+      coord.tick()
+      expect(coord.isOwner()).toBe(true)
+    })
+  })
+
+  describe("F13: stale-cleanup grace period", () => {
+    test("stale peer is excluded from election on first scan but not yet unlinked", () => {
+      const now = Date.now()
+      writePeer({
+        pid: 2000,
+        startedAt: now - 100_000,
+        lastActivity: now + 60_000,
+        lastSeen: now - 30_000,
+      })
+
+      const coord = new InstanceCoordinator({
+        instancesDir: dir,
+        pid: 1000,
+        staleThresholdMs: 10_000,
+        staleGracePeriodTicks: 2,
+      })
+      coord.tick()
+
+      expect(coord.isOwner()).toBe(true)
+      expect(readdirSync(dir)).toContain("2000.json")
+    })
+
+    test("peer is unlinked after grace period elapses across consecutive ticks", () => {
+      const now = Date.now()
+      writePeer({
+        pid: 2000,
+        startedAt: now - 100_000,
+        lastActivity: now,
+        lastSeen: now - 30_000,
+      })
+
+      const coord = new InstanceCoordinator({
+        instancesDir: dir,
+        pid: 1000,
+        staleThresholdMs: 10_000,
+        staleGracePeriodTicks: 2,
+      })
+
+      coord.tick()
+      expect(readdirSync(dir)).toContain("2000.json")
+
+      coord.tick()
+      expect(readdirSync(dir)).toContain("2000.json")
+
+      coord.tick()
+      expect(readdirSync(dir)).not.toContain("2000.json")
     })
   })
 })

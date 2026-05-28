@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test"
 import {
+  buildInstancesDir,
+  createOwnershipHandler,
+  createRecapScheduler,
   isPrimaryPluginInstance,
   releasePrimaryPluginInstance,
   startPluginAsync,
@@ -831,7 +834,6 @@ describe("startPluginAsync — non-blocking init", () => {
       connect: () => Promise.reject(new Error("boom")),
     }
 
-    // Must not throw synchronously and must not return a rejected Promise
     expect(() =>
       startPluginAsync(
         mockRpc as unknown as DiscordRPCService,
@@ -839,5 +841,366 @@ describe("startPluginAsync — non-blocking init", () => {
         () => {},
       ),
     ).not.toThrow()
+  })
+
+  test("F9: does NOT start rotation timer or connect when isOwner returns false", () => {
+    let timerStarted = false
+    let pushCalled = false
+    let connectCalled = false
+
+    const mockRpc = {
+      isConnected: () => false,
+      connect: () => {
+        connectCalled = true
+        return Promise.resolve(true)
+      },
+    }
+
+    startPluginAsync(
+      mockRpc as unknown as DiscordRPCService,
+      async () => {
+        pushCalled = true
+      },
+      () => {
+        timerStarted = true
+      },
+      () => false,
+    )
+
+    expect(timerStarted).toBe(false)
+    expect(pushCalled).toBe(false)
+    expect(connectCalled).toBe(false)
+  })
+})
+
+describe("buildInstancesDir", () => {
+  test("path includes hostname and clientId subdirectories", () => {
+    const result = buildInstancesDir("/home/u", "host-1", "12345")
+    expect(result).toBe("/home/u/.opencode-discord-presence/instances/host-1/12345")
+  })
+
+  test("sanitizes unsafe characters in hostname and clientId", () => {
+    const result = buildInstancesDir("/home/u", "host:with/slashes", "client id!")
+    expect(result).toBe("/home/u/.opencode-discord-presence/instances/host_with_slashes/client_id_")
+  })
+
+  test("falls back to placeholders when components are empty", () => {
+    const result = buildInstancesDir("/home/u", "", "")
+    expect(result).toBe("/home/u/.opencode-discord-presence/instances/unknown-host/default")
+  })
+
+  test("two different clientIds produce different paths", () => {
+    const a = buildInstancesDir("/home/u", "host", "app-a")
+    const b = buildInstancesDir("/home/u", "host", "app-b")
+    expect(a).not.toBe(b)
+  })
+
+  test("two different hostnames produce different paths", () => {
+    const a = buildInstancesDir("/home/u", "host-a", "app")
+    const b = buildInstancesDir("/home/u", "host-b", "app")
+    expect(a).not.toBe(b)
+  })
+})
+
+describe("createOwnershipHandler", () => {
+  type FakeRPC = {
+    connect: () => Promise<boolean>
+    disconnect: () => Promise<void>
+    clear: () => Promise<void>
+  }
+
+  function makeRpc(): {
+    rpc: FakeRPC
+    calls: { connect: number; disconnect: number; clear: number }
+  } {
+    const calls = { connect: 0, disconnect: 0, clear: 0 }
+    const rpc: FakeRPC = {
+      connect: () => {
+        calls.connect++
+        return Promise.resolve(true)
+      },
+      disconnect: () => {
+        calls.disconnect++
+        return Promise.resolve()
+      },
+      clear: () => {
+        calls.clear++
+        return Promise.resolve()
+      },
+    }
+    return { rpc, calls }
+  }
+
+  test("F11: gaining ownership waits for settle window before calling connect", async () => {
+    const { rpc, calls } = makeRpc()
+    let rotationStarted = 0
+
+    const handler = createOwnershipHandler({
+      rpc: rpc as unknown as DiscordRPCService,
+      pushPresence: async () => {},
+      startRotationTimer: () => {
+        rotationStarted++
+      },
+      stopRotationTimer: () => {},
+      isStillOwner: () => true,
+      settleMs: 20,
+    })
+
+    handler.onOwnership(true)
+    expect(calls.connect).toBe(0)
+    expect(rotationStarted).toBe(0)
+
+    await new Promise((r) => setTimeout(r, 50))
+
+    expect(calls.connect).toBe(1)
+    expect(rotationStarted).toBe(1)
+    handler.cancelPending()
+  })
+
+  test("F11: ownership lost during settle cancels the pending connect", async () => {
+    const { rpc, calls } = makeRpc()
+
+    const handler = createOwnershipHandler({
+      rpc: rpc as unknown as DiscordRPCService,
+      pushPresence: async () => {},
+      startRotationTimer: () => {},
+      stopRotationTimer: () => {},
+      isStillOwner: () => true,
+      settleMs: 30,
+    })
+
+    handler.onOwnership(true)
+    await new Promise((r) => setTimeout(r, 10))
+    handler.onOwnership(false)
+    await new Promise((r) => setTimeout(r, 50))
+
+    expect(calls.connect).toBe(0)
+    expect(calls.disconnect).toBe(1)
+    expect(calls.clear).toBe(1)
+  })
+
+  test("F11: losing ownership disconnects and clears immediately (no settle)", async () => {
+    const { rpc, calls } = makeRpc()
+
+    const handler = createOwnershipHandler({
+      rpc: rpc as unknown as DiscordRPCService,
+      pushPresence: async () => {},
+      startRotationTimer: () => {},
+      stopRotationTimer: () => {},
+      isStillOwner: () => true,
+      settleMs: 30,
+    })
+
+    handler.onOwnership(false)
+    expect(calls.disconnect).toBe(1)
+    expect(calls.clear).toBe(1)
+    expect(calls.connect).toBe(0)
+  })
+
+  test("F11: settle re-checks isStillOwner before connecting (avoids stale connect)", async () => {
+    const { rpc, calls } = makeRpc()
+    let isOwnerNow = true
+
+    const handler = createOwnershipHandler({
+      rpc: rpc as unknown as DiscordRPCService,
+      pushPresence: async () => {},
+      startRotationTimer: () => {},
+      stopRotationTimer: () => {},
+      isStillOwner: () => isOwnerNow,
+      settleMs: 20,
+    })
+
+    handler.onOwnership(true)
+    isOwnerNow = false
+    await new Promise((r) => setTimeout(r, 40))
+
+    expect(calls.connect).toBe(0)
+  })
+
+  test("F11: cancelPending() stops a scheduled connect", async () => {
+    const { rpc, calls } = makeRpc()
+
+    const handler = createOwnershipHandler({
+      rpc: rpc as unknown as DiscordRPCService,
+      pushPresence: async () => {},
+      startRotationTimer: () => {},
+      stopRotationTimer: () => {},
+      isStillOwner: () => true,
+      settleMs: 30,
+    })
+
+    handler.onOwnership(true)
+    handler.cancelPending()
+    await new Promise((r) => setTimeout(r, 50))
+
+    expect(calls.connect).toBe(0)
+  })
+
+  test("default settleMs strictly exceeds coordinator tick interval (handoff race fix)", async () => {
+    const { rpc, calls } = makeRpc()
+    let connectAt: number | null = null
+
+    const startedAt = Date.now()
+    const handler = createOwnershipHandler({
+      rpc: {
+        ...rpc,
+        connect: () => {
+          connectAt = Date.now()
+          calls.connect++
+          return Promise.resolve(true)
+        },
+      } as unknown as DiscordRPCService,
+      pushPresence: async () => {},
+      startRotationTimer: () => {},
+      stopRotationTimer: () => {},
+      isStillOwner: () => true,
+    })
+
+    handler.onOwnership(true)
+    await new Promise((r) => setTimeout(r, 1500))
+
+    expect(calls.connect).toBe(1)
+    expect(connectAt).not.toBeNull()
+    const elapsed = (connectAt as unknown as number) - startedAt
+    expect(elapsed).toBeGreaterThan(1000)
+  })
+})
+
+describe("recap reducer clearing contract (oracle P1)", () => {
+  test("updateRecapCache({}) on a populated cache does NOT clear timestamp (documents the regression)", () => {
+    let snapshot = createInitialPresenceState()
+    snapshot = presenceReducer(
+      snapshot,
+      updateRecapCache({
+        messageCount: 27,
+        filesTouched: ["a.ts", "b.ts"],
+        uniqueFileCount: 2,
+        activeDurationSeconds: 3600,
+        timestamp: 1_700_000_000_000,
+      }),
+    )
+
+    snapshot = presenceReducer(snapshot, updateRecapCache({}))
+
+    expect(snapshot.recapCache.timestamp).toBe(1_700_000_000_000)
+    expect(snapshot.recapCache.messageCount).toBe(27)
+  })
+
+  test("direct snapshot.recapCache reset DOES clear all fields", () => {
+    let snapshot = createInitialPresenceState()
+    snapshot = presenceReducer(
+      snapshot,
+      updateRecapCache({
+        messageCount: 27,
+        filesTouched: ["a.ts"],
+        uniqueFileCount: 1,
+        activeDurationSeconds: 1000,
+        timestamp: 1_700_000_000_000,
+      }),
+    )
+
+    snapshot = { ...snapshot, recapCache: {} }
+
+    expect(snapshot.recapCache.timestamp).toBeUndefined()
+    expect(snapshot.recapCache.messageCount).toBeUndefined()
+  })
+
+  test("recap-then-activity-within-30s: after reset, getActivity shows new activity, NOT recap", () => {
+    const opts: RichPresenceOptions = {
+      enableFileSpotlight: true,
+      enableMissionBoard: true,
+      rotationIntervalSeconds: 20,
+      diagnostics: { errorsOnly: true },
+      mainAgentOnly: false,
+    }
+
+    let snapshot = createInitialPresenceState()
+    snapshot = presenceReducer(snapshot, updateIdentity({ agent: "Claude", model: "opus-4-5" }))
+    snapshot = presenceReducer(
+      snapshot,
+      updateRecapCache({
+        messageCount: 27,
+        filesTouched: ["x.ts"],
+        uniqueFileCount: 1,
+        activeDurationSeconds: 3600,
+        timestamp: Date.now(),
+      }),
+    )
+
+    expect(getActivity(snapshot, opts, 0).details).toBe("Session Complete!")
+
+    snapshot = { ...snapshot, recapCache: {} }
+    snapshot = presenceReducer(
+      snapshot,
+      updateFileAction({ file: "src/new.ts", action: "edit", operation: "Editing" }),
+    )
+
+    const activity = getActivity(snapshot, opts, 0)
+    expect(activity.details).not.toBe("Session Complete!")
+    expect(activity.details).toContain("Claude")
+  })
+})
+
+describe("createRecapScheduler", () => {
+  function makeScheduler(delayMs: number): {
+    scheduler: ReturnType<typeof createRecapScheduler>
+    cleared: () => number
+  } {
+    let cleared = 0
+    const scheduler = createRecapScheduler({
+      clearRecapState: () => {
+        cleared++
+      },
+      delayMs,
+    })
+    return { scheduler, cleared: () => cleared }
+  }
+
+  test("F10: scheduled clear runs after delay", async () => {
+    const { scheduler, cleared } = makeScheduler(20)
+    scheduler.schedule()
+    expect(cleared()).toBe(0)
+    await new Promise((r) => setTimeout(r, 60))
+    expect(cleared()).toBe(1)
+  })
+
+  test("F10: flushNow runs clear immediately and cancels pending timer", async () => {
+    const { scheduler, cleared } = makeScheduler(10_000)
+    scheduler.schedule()
+    scheduler.flushNow()
+    expect(cleared()).toBe(1)
+    await new Promise((r) => setTimeout(r, 20))
+    expect(cleared()).toBe(1)
+  })
+
+  test("F10: cancel clears the timer without running clear", async () => {
+    const { scheduler, cleared } = makeScheduler(20)
+    scheduler.schedule()
+    scheduler.cancel()
+    await new Promise((r) => setTimeout(r, 60))
+    expect(cleared()).toBe(0)
+  })
+
+  test("F10: re-scheduling replaces the previous pending clear", async () => {
+    const { scheduler, cleared } = makeScheduler(30)
+    scheduler.schedule()
+    scheduler.schedule()
+    await new Promise((r) => setTimeout(r, 80))
+    expect(cleared()).toBe(1)
+  })
+
+  test("F10: flushNow without schedule is a no-op", () => {
+    const { scheduler, cleared } = makeScheduler(20)
+    scheduler.flushNow()
+    expect(cleared()).toBe(0)
+  })
+
+  test("F10: flushNow after timer already ran does not re-clear", async () => {
+    const { scheduler, cleared } = makeScheduler(10)
+    scheduler.schedule()
+    await new Promise((r) => setTimeout(r, 40))
+    expect(cleared()).toBe(1)
+    scheduler.flushNow()
+    expect(cleared()).toBe(1)
   })
 })
