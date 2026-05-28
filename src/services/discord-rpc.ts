@@ -35,6 +35,20 @@ function truncate(str: string, maxLen: number): string {
 
 export { MAX_RETRIES }
 
+/**
+ * Gate for the "Connection failed:" log emitted from the connect() catch path.
+ *
+ * Returns true ONLY on the initial connect attempt (retryCount === 0). During
+ * the scheduleReconnect() retry cycle the catch fires again with retryCount
+ * already incremented, so the same identical log would otherwise repeat once
+ * per retry (up to MAX_RETRIES + 1 = 11 lines per blocked startup). The
+ * subsequent retries stay silent; the final "Max retries reached" log still
+ * informs the user the cycle ended. See issue #7 (multi-CLI noise).
+ */
+export function shouldLogConnectFailure(retryCount: number): boolean {
+  return retryCount === 0
+}
+
 export interface DiscordRPCOptions {
   debug?: boolean
 }
@@ -168,7 +182,9 @@ export class DiscordRPCService {
             resolve(false)
             return
           }
-          this.log("Connection failed:", err?.message || err)
+          if (shouldLogConnectFailure(this.retryCount)) {
+            this.log("Connection failed:", err?.message || err)
+          }
           this.scheduleReconnect()
           resolve(false)
         })
