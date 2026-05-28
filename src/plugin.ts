@@ -3,6 +3,7 @@ import { join } from "node:path"
 import type { Plugin } from "@opencode-ai/plugin"
 import { getConfig } from "./config.js"
 import { createRecapCleanupTask, DiscordRPCService } from "./services/discord-rpc.js"
+import { InstanceCoordinator } from "./services/instance-coordinator.js"
 import { PresenceOrchestrator } from "./services/presence-orchestrator.js"
 import { SessionTracker } from "./services/session-tracker.js"
 import {
@@ -156,8 +157,10 @@ export function startPluginAsync(
   rpc: Pick<DiscordRPCService, "isConnected" | "connect">,
   pushPresence: () => Promise<void>,
   startRotationTimer: () => void,
+  isOwner: () => boolean = () => true,
 ): void {
   startRotationTimer()
+  if (!isOwner()) return
   void pushPresence()
   if (!rpc.isConnected()) {
     rpc.connect().catch(() => {})
@@ -230,11 +233,20 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
     return false
   }
 
+  // Coordinator: in a multi-CLI setup, only the instance with the most
+  // recent chat.message activity should drive Discord presence. See issue #9.
+  const coordinator = new InstanceCoordinator({
+    instancesDir: join(homedir(), ".opencode-discord-presence", "instances"),
+  })
+
   /**
    * Pushes the current snapshot + live metrics to Discord via the rotation engine.
+   * No-op when this instance is not the active owner — the owning CLI's plugin
+   * pushes its own snapshot; we don't want to clobber it.
    */
   const pushPresence = async () => {
     if (!rpc) return
+    if (!coordinator.isOwner()) return
     // Derive sessionMetrics from live metrics state for every Discord push
     const snapshotWithMetrics: PresenceSnapshot = {
       ...snapshot,
@@ -289,13 +301,36 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
     }
   }
 
-  startPluginAsync(rpc, pushPresence, startRotationTimer)
+  coordinator.onOwnershipChange((isOwner) => {
+    if (!rpc) return
+    if (isOwner) {
+      rpc.connect().catch(() => {})
+      void pushPresence()
+    } else {
+      void rpc.clear()
+      void rpc.disconnect()
+    }
+  })
+  coordinator.start()
+
+  startPluginAsync(rpc, pushPresence, startRotationTimer, () => coordinator.isOwner())
 
   return {
+    dispose: async () => {
+      coordinator.stop()
+      stopRotationTimer()
+      if (!rpc) return
+      const current = rpc
+      rpc = null
+      await current.clear()
+      await current.disconnect()
+    },
     // ── chat.message ────────────────────────────────────────────────────────────
     "chat.message": async (input, _output) => {
       const sessionID = (input as { sessionID?: string }).sessionID ?? ""
       if (await shouldSkipSession(sessionID)) return
+
+      coordinator.recordActivity()
 
       const agent = input.agent ?? snapshot.identity.agent
       const model = input.model?.modelID ?? snapshot.identity.model

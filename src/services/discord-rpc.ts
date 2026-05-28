@@ -113,6 +113,15 @@ export class DiscordRPCService {
   async connect(): Promise<boolean> {
     if (this.connected) return true
 
+    // connect() is an explicit "I want to be connected" signal. Reset the
+    // disconnect-state flags so that (a) scheduleReconnect() can fire after a
+    // prior manual disconnect() and (b) the 'ready' replay path is allowed to
+    // resend currentPresence. Without this, a coordinator-driven ownership
+    // flip (disconnect → reconnect cycle) would silently fail to retry on
+    // transient connection failures. See issue #9.
+    this.disconnecting = false
+    this.cleared = false
+
     return new Promise((resolve) => {
       try {
         this.client = new Client({ clientId: this.clientId })
