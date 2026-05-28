@@ -109,6 +109,10 @@ export class DiscordRPCService {
     this.connected = connected
   }
 
+  _setRetryCount(n: number) {
+    this.retryCount = n
+  }
+
   _overrideClient(client: Client) {
     this.client = client
   }
@@ -147,6 +151,15 @@ export class DiscordRPCService {
     // transient connection failures. See issue #9.
     this.disconnecting = false
     this.cleared = false
+
+    // Self-heal: if a previous retry cycle exhausted MAX_RETRIES and bailed,
+    // an external connect() request (ownership flip OR user-activity-driven
+    // recovery in the plugin layer) means we should try again with a fresh
+    // retry budget. scheduleReconnect() never reaches connect() while at the
+    // cap (it bails first), so resetting here only affects explicit callers.
+    if (this.retryCount >= MAX_RETRIES) {
+      this.retryCount = 0
+    }
 
     const myGeneration = ++this.clientGeneration
 

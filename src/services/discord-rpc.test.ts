@@ -518,6 +518,35 @@ describe("DiscordRPCService", () => {
       expect(rpc._getClientGeneration()).toBe(before)
     })
   })
+
+  describe("recovery after MAX_RETRIES (self-heal on explicit connect)", () => {
+    test("explicit connect() resets retryCount when previously exhausted", () => {
+      const rpc = new DiscordRPCService("123")
+      rpc._setRetryCount(MAX_RETRIES)
+      expect(rpc._getState().retryCount).toBe(MAX_RETRIES)
+
+      void rpc.connect()
+
+      expect(rpc._getState().retryCount).toBe(0)
+    })
+
+    test("explicit connect() leaves retryCount untouched when still under budget", () => {
+      const rpc = new DiscordRPCService("123")
+      rpc._setRetryCount(3)
+
+      void rpc.connect()
+
+      expect(rpc._getState().retryCount).toBe(3)
+    })
+
+    test("connect() short-circuit (already connected) does not reset retryCount", async () => {
+      const rpc = new DiscordRPCService("123")
+      rpc._setConnected(true)
+      rpc._setRetryCount(MAX_RETRIES)
+      await rpc.connect()
+      expect(rpc._getState().retryCount).toBe(MAX_RETRIES)
+    })
+  })
 })
 
 describe("DiscordRPCService logging", () => {
