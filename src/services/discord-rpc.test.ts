@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
-import { createRecapCleanupTask, DiscordRPCService, MAX_RETRIES } from "./discord-rpc"
+import {
+  createRecapCleanupTask,
+  DiscordRPCService,
+  MAX_RETRIES,
+  shouldLogConnectFailure,
+} from "./discord-rpc"
 
 // ─── Mock Client ───────────────────────────────────────────────────────────────
 
@@ -286,6 +291,68 @@ describe("DiscordRPCService", () => {
         details: string
       }
       expect(lastCall.details).toBe("Activity 3")
+    })
+  })
+
+  describe("connect failure log gating", () => {
+    test("shouldLogConnectFailure emits only on the first attempt (retryCount === 0)", () => {
+      expect(shouldLogConnectFailure(0)).toBe(true)
+      expect(shouldLogConnectFailure(1)).toBe(false)
+      expect(shouldLogConnectFailure(5)).toBe(false)
+      expect(shouldLogConnectFailure(MAX_RETRIES)).toBe(false)
+    })
+
+    test("warn() is silent when debug is false (default)", async () => {
+      const captured: unknown[][] = []
+      const origWarn = console.warn
+      console.warn = (...args: unknown[]) => {
+        captured.push(args)
+      }
+
+      try {
+        const mockClient = createMockClient()
+        mockClient.destroy = async () => {
+          throw new Error("boom")
+        }
+
+        const rpc = new DiscordRPCService("123")
+        // @ts-expect-error — test injection
+        rpc._overrideClient(mockClient)
+        rpc._setConnected(true)
+
+        await rpc.disconnect()
+
+        expect(captured).toEqual([])
+      } finally {
+        console.warn = origWarn
+      }
+    })
+
+    test("warn() emits when debug is true", async () => {
+      const captured: unknown[][] = []
+      const origWarn = console.warn
+      console.warn = (...args: unknown[]) => {
+        captured.push(args)
+      }
+
+      try {
+        const mockClient = createMockClient()
+        mockClient.destroy = async () => {
+          throw new Error("boom")
+        }
+
+        const rpc = new DiscordRPCService("123", { debug: true })
+        // @ts-expect-error — test injection
+        rpc._overrideClient(mockClient)
+        rpc._setConnected(true)
+
+        await rpc.disconnect()
+
+        expect(captured.length).toBe(1)
+        expect(String(captured[0][0])).toContain("[discord-presence]")
+      } finally {
+        console.warn = origWarn
+      }
     })
   })
 
