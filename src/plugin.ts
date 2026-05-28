@@ -138,6 +138,32 @@ function countRotatingCards(
   return Math.max(count, 1)
 }
 
+/**
+ * Kicks off plugin runtime side-effects WITHOUT blocking on the initial
+ * Discord connection. OpenCode awaits the plugin init promise during
+ * bootstrap, so the IPC timeout (~10s when Discord is closed) used to
+ * stall the entire UI. The MCP-style lazy approach:
+ *   1) start the rotation timer immediately (no-op pushes are harmless),
+ *   2) queue initial presence locally — the RPC service replays
+ *      `currentPresence` from its 'ready' handler on every successful
+ *      connect, including via `scheduleReconnect()`,
+ *   3) fire `connect()` fire-and-forget; the catch swallows the
+ *      defensive case where connect() ever rejects (the current
+ *      implementation always resolves, but we don't want a future
+ *      refactor to surface an unhandled rejection here).
+ */
+export function startPluginAsync(
+  rpc: Pick<DiscordRPCService, "isConnected" | "connect">,
+  pushPresence: () => Promise<void>,
+  startRotationTimer: () => void,
+): void {
+  startRotationTimer()
+  void pushPresence()
+  if (!rpc.isConnected()) {
+    rpc.connect().catch(() => {})
+  }
+}
+
 export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
   const fileOptions = await loadConfigFile(ctx.directory)
   const config = getConfig(fileOptions)
@@ -263,11 +289,7 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
     }
   }
 
-  const connected = rpc.isConnected() || (await rpc.connect())
-  if (connected) {
-    await pushPresence()
-    startRotationTimer()
-  }
+  startPluginAsync(rpc, pushPresence, startRotationTimer)
 
   return {
     // ── chat.message ────────────────────────────────────────────────────────────
