@@ -1,6 +1,6 @@
+import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
-import { readFile } from "node:fs/promises"
 import type { Plugin } from "@opencode-ai/plugin"
 import { getConfig } from "./config.js"
 import { createRecapCleanupTask, DiscordRPCService } from "./services/discord-rpc.js"
@@ -44,6 +44,7 @@ async function loadConfigFile(directory: string): Promise<DiscordPresenceOptions
       const content = await readFile(configPath, "utf-8")
       return JSON.parse(content) as DiscordPresenceOptions
     } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue
       console.warn("[discord-presence] Failed to load config file:", error)
     }
   }
@@ -281,8 +282,12 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
     await current.disconnect()
   }
 
-  process.on("SIGINT", () => { void shutdown() })
-  process.on("SIGTERM", () => { void shutdown() })
+  process.on("SIGINT", () => {
+    void shutdown()
+  })
+  process.on("SIGTERM", () => {
+    void shutdown()
+  })
 
   return {
     dispose: () => shutdown(),

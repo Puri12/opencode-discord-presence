@@ -154,6 +154,10 @@ export class DiscordRPCService {
       return
     }
 
+    // Capture before mutating — used to decide whether disconnect() needs to
+    // call clearActivity itself or if a prior clear() already handled it.
+    const alreadyCleared = this.cleared
+
     this.disconnecting = true
     this.connected = false
     this.retryCount = 0
@@ -173,10 +177,11 @@ export class DiscordRPCService {
     // Clear the Discord activity before destroying the client.
     // Discord does not auto-expire RPC states — without this the last
     // presence would stay visible forever after an unclean shutdown.
+    // Skip if a prior clear() already sent clearActivity for this client.
     const client = this.client
     this.client = null
 
-    if (client?.user) {
+    if (client?.user && !alreadyCleared) {
       try {
         await client.user.clearActivity()
       } catch (error) {
