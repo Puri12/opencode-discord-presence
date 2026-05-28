@@ -9,6 +9,13 @@ const DEBOUNCE_MS = 100
 const MAX_DETAILS_LENGTH = 126
 const MAX_STATE_LENGTH = 126
 
+const PRESENCE_BUTTONS: NonNullable<SetActivity["buttons"]> = [
+  {
+    label: "View on GitHub",
+    url: "https://github.com/Puri12/opencode-discord-presence",
+  },
+]
+
 export function createRecapCleanupTask(
   rpc: DiscordRPCService | null,
   clearRecapState: () => void,
@@ -218,6 +225,7 @@ export class DiscordRPCService {
       largeImageText: assets?.largeImageText ?? "OpenCode",
       smallImageKey: assets?.smallImageKey,
       smallImageText: assets?.smallImageText,
+      buttons: PRESENCE_BUTTONS,
     }
 
     this.currentPresence = activity
