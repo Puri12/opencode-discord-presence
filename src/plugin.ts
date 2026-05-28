@@ -497,6 +497,17 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
       if (await shouldSkipSession(sessionID)) return
 
       coordinator.recordActivity({ flush: true })
+
+      // Self-heal: if we are owner but the RPC has fallen out of `connected`
+      // (transient Discord IPC failure exhausted MAX_RETRIES so
+      // scheduleReconnect bailed) treat user activity as the signal to try
+      // again. connect() internally resets retryCount when previously at the
+      // cap, so this gets a fresh budget without bypassing the retry limit
+      // for the ongoing failure cycle.
+      if (rpc && coordinator.isOwner() && !rpc.isConnected()) {
+        rpc.connect().catch(() => {})
+      }
+
       exitRecapIfNeeded()
 
       const agent = input.agent ?? snapshot.identity.agent

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-05-28
+
+### Fixed
+
+- **Presence stuck forever after "Max retries reached"**. Production trace from a multi-CLI session showed Discord IPC entering a "Closed by Discord" + handshake-timeout state (likely from stale connections accumulated across rapid ownership-flip cycles). After `MAX_RETRIES=10` (≈50 s) `scheduleReconnect()` bailed with "not scheduling further reconnects" and presence stayed gone permanently — the only existing recovery path was an ownership FLIP, which never happens in a single-active-CLI scenario.
+
+  Two coordinated changes restore self-healing:
+  1. `DiscordRPCService.connect()` now resets `retryCount` to 0 when invoked while at or above `MAX_RETRIES`. The retry cap is enforced by `scheduleReconnect()` which bails before reaching `connect()`, so this reset only affects EXPLICIT callers (ownership handler, user-activity recovery path) — it cannot bypass the retry limit for the in-flight failure cycle.
+  2. The plugin's `chat.message` handler now checks `coordinator.isOwner() && !rpc.isConnected()` after recording activity and fires `rpc.connect()` if so. User activity is treated as the recovery trigger — typing in any CLI prompts a fresh connect attempt with a clean retry budget. Combined with the connect-side reset above, the natural UX is "user resumes work → presence comes back."
+
+  Workaround for users on 0.7.1: quit & restart Discord (clears server-side IPC state), then restart opencode (resets plugin retryCount). 0.7.2 makes both restarts unnecessary for transient failures.
+
 ## [0.7.1] - 2026-05-28
 
 ### Fixed
