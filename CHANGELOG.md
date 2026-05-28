@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-05-28
+
+### Added
+
+- **"View on GitHub" button on Rich Presence** ([#5](https://github.com/Puri12/opencode-discord-presence/issues/5), [#6](https://github.com/Puri12/opencode-discord-presence/pull/6)). Every activity card now carries a single hardcoded link button pointing to the project repo, applied uniformly across all states (file spotlight, mission board, idle, recap). Note: Discord renders Rich Presence buttons only on *other users viewing the profile*, never on the user themself — same product limitation as every Discord RPC client.
+
 ## [0.5.1] - 2026-05-28
 
 ### Fixed
