@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-28
+
+### Added
+
+- **Last-active CLI drives Discord presence** ([#9](https://github.com/Puri12/opencode-discord-presence/issues/9), [#10](https://github.com/Puri12/opencode-discord-presence/pull/10)). When multiple OpenCode CLI instances run on the same machine, Discord Rich Presence now follows whichever CLI the user is actually typing in. Previously the first CLI to start grabbed Discord's single IPC socket and held it forever, leaving later-active CLIs silent.
+
+  Design: each plugin writes a per-PID heartbeat under `~/.opencode-discord-presence/instances/<hostname>/<clientId>/<pid>.json` carrying `{pid, instanceId, startedAt, lastActivity, lastSeen}`. A 1 s tick refreshes own file, scans peers, and elects `max(lastActivity)` as owner. Ownership transitions disconnect the previous owner immediately and reconnect the new owner after a 1.2 s settle delay (strictly longer than the 1 s tick so the previous owner has time to clear and disconnect before the new owner contends for the IPC socket).
+
+  Steady-state cost: ~1–2 ms CPU/sec, 1 file write/sec per instance. Discord reconnects only on actual ownership flips, and the brief gap is hidden by Discord's ~10 s presence cache. New module exports: `InstanceCoordinator`, `buildInstancesDir`, `createOwnershipHandler`, `createRecapScheduler`.
+
+- **`process.on('SIGINT'/'SIGTERM')` shutdown path** now runs the same full teardown as the `dispose` hook — releases the primary-plugin guard, cancels pending settle/recap timers, unlinks the coordinator heartbeat, stops rotation, clears Discord activity, and disconnects RPC. Combined with [#2](https://github.com/Puri12/opencode-discord-presence/pull/2)'s lifecycle hooks, every exit path (graceful or signal-driven) leaves a clean state.
+
+- **Multi-CLI QA scripts** under `scripts/multi-cli-coordinator-qa.ts` (21 in-process scenarios covering F1–F13 plus 3+ CLI concurrent startup and owner-stop hand-over) and `scripts/multi-process-coordinator-qa.ts` (6 scenarios using real `child_process.fork` workers to exercise cross-process file coordination).
+
+### Fixed
+
+- **Startup focus theft** (F1). A freshly-launched CLI no longer outranks an already-running CLI that has had recent user activity. `lastActivity` defaults to a `0` sentinel and the tied-activity tiebreak now prefers the OLDER `startedAt` then LOWER `pid` (stability over recency). Auto-reload of plugin config no longer mid-flight steals presence from another CLI either.
+
+- **Non-atomic coordinator writes** (F2). `writeOwnFile` now writes to a `.tmp` sibling then `renameSync`, and `findWinner` only scans `.json` files. Peers can no longer observe partial JSON during a heartbeat write — eliminates the "peer file missing for one tick → ownership flap" race.
+
+- **Cross-machine false-peer suppression** (F3/F6). The instances directory is now namespaced per `os.hostname()` and per Discord application ID. Shared-HOME setups (NFS, SMB, Dropbox, iCloud Drive) no longer make one machine's CLIs suppress another's, and users running multiple Discord application IDs no longer cross-contaminate.
+
+- **Heartbeat write failure split-brain** (F4). `writeOwnFile()` now returns a boolean; on filesystem failure (`ENOSPC`/`EACCES`) the coordinator force-demotes itself, fires `onOwnershipChange(false)`, and skips the election for that tick. Fail-closed — if we cannot publish a heartbeat we must not own the Discord IPC.
+
+- **Same-PID reload deletes new heartbeat** (F5). Each coordinator now carries a `instanceId` field; `stop()` reads the file first and only unlinks if the embedded `instanceId` matches own. A reload-before-dispose race can no longer delete the replacement coordinator's heartbeat.
+
+- **Future-timestamp peer hijacks ownership** (F7). `findWinner` validates peer records against a schema (finite numbers, non-negative timestamps) and rejects any record with `lastActivity`/`lastSeen` beyond `Date.now() + allowedClockSkewMs` (default 60 s). A bogus or corrupted peer record can no longer pin ownership indefinitely.
+
+- **Session-metrics cross-CLI clobbering** (F8). `saveSessionMetrics`/`loadSessionMetrics`/`clearSessionMetrics` accept `{ instanceId }`; per-CLI files are stored as `session-metrics-<uuid>.json`. New `pruneStaleSessionMetrics()` runs on plugin init to GC orphan files from crashed CLIs (savedAt > 30 min, with `mtime` fallback).
+
+- **Rotation timer keeps event loop alive for non-owner** (F9). The 20 s rotation `setInterval` is now started only after ownership is confirmed and is `.unref()`'d, so a non-owner CLI exits cleanly even if other lifecycle hooks are still pending.
+
+- **30 s recap timer leaks captured RPC** (F10). The post-session recap is now a pure visual state on the snapshot (`createRecapScheduler` clears `recapCache` after the delay). The RPC lifecycle stays tied to ownership, so dispose / ownership loss / fresh activity each cancel the recap cleanly without leaking the Discord IPC socket. `exitRecapIfNeeded()` is called from `chat.message` so user activity within the 30 s window resumes normal presence immediately.
+
+- **Recap card never actually cleared** — the previous `updateRecapCache({})` reducer call merged the empty object and left the `timestamp` populated, pinning the "Session Complete!" card past its 30 s window. Replaced with a direct `snapshot.recapCache = {}` reset plus `void pushPresence()` so Discord receives the post-recap state immediately.
+
+- **Discord RPC zombie state on rapid disconnect/connect** — `DiscordRPCService` now carries a monotonic `clientGeneration` counter. `connect()` captures `myGeneration` before creating the `Client`; each of the three callback paths (`ready`, `disconnected`, `login.catch`) bails on generation mismatch. `disconnect()` increments the counter to invalidate any in-flight handlers from the old client. Without this, a late `ready` from a destroyed client could flip `connected=true` while `client=null`, silently dropping every subsequent `setActivity`.
+
+- **Owner-acquire timing race** (F11). `createOwnershipHandler` introduces a 1.2 s settle window between ownership gain and `rpc.connect()` so the previous owner has time to `clear()` + `disconnect()` before the new owner contends for Discord's single IPC socket. The settle delay is constrained to be strictly greater than the coordinator's 1 s tick interval. Ownership loss disconnects immediately. Initial owner bootstrap also routes through this path for consistent solo-CLI startup behavior.
+
+- **Stale-peer cleanup destroys live peers across machine sleep** (F13). Stale peer files are now excluded from election immediately but only unlinked after a configurable `staleGracePeriodTicks` (default 2). After macOS/Linux wake-from-sleep, the first waking CLI no longer deletes peers that simply have not had a chance to tick yet.
+
+- **Activity flush latency** (F12). `recordActivity({ flush: true })` writes the own file and runs `tick()` synchronously; `chat.message` uses it so a user typing in CLI B flips ownership within the same event turn instead of waiting up to 1 s for the next periodic tick.
+
+### Verification
+
+`bun test`: 302 pass / 0 fail (+45 vs 0.6.0). `scripts/multi-cli-coordinator-qa.ts`: 21/21 stable across 5 consecutive runs. `scripts/multi-process-coordinator-qa.ts`: 6/6 with real OS fork workers.
+
+### Known limitations
+
+- The `primaryPluginActive` same-PID guard is module-scoped — if OpenCode loads two physically distinct module copies in the same process they both run. Not affected by the common single-registration setup; a file-based per-PID lock would harden this further.
+- SIGKILL (uncatchable) and abrupt terminal closes still bypass the shutdown hook, leaving the coordinator heartbeat on disk. The stale-cleanup grace period eventually GCs it; opening fresh CLIs is not affected.
+
+## [0.6.0] - 2026-05-28
+
+### Added
+
+- **OpenCode Desktop compatibility** ([#2](https://github.com/Puri12/opencode-discord-presence/pull/2)). Replaced `Bun.file()` / `Bun.write()` with `node:fs/promises` so the plugin loads inside OpenCode Desktop's Node.js (Electron) sidecar where the global `Bun` is undefined. Plain Node.js APIs work equally well in Bun, so the TUI is unaffected.
+- **Plugin lifecycle hooks** ([#2](https://github.com/Puri12/opencode-discord-presence/pull/2)). Added a `dispose` hook plus `SIGINT` / `SIGTERM` fallbacks that stop the rotation timer, clear the Discord activity, and disconnect the RPC client. Presence no longer lingers on Discord after OpenCode shuts down.
+
+### Fixed
+
+- **Stale presence on graceful shutdown** ([#2](https://github.com/Puri12/opencode-discord-presence/pull/2)). `disconnect()` now explicitly sends `clearActivity` before destroying the RPC client. Combined with the new lifecycle hooks above, this ensures Discord drops the presence card immediately on quit instead of holding the last state indefinitely.
+- **Double `clearActivity` on session recap teardown** (review follow-up on [#2](https://github.com/Puri12/opencode-discord-presence/pull/2)). `disconnect()` now skips the `clearActivity` call when a prior `clear()` already sent one — keeps the recap-cleanup test suite GREEN and avoids hammering Discord with redundant RPC calls.
+- **Spurious warn on first launch without config file** (review follow-up on [#2](https://github.com/Puri12/opencode-discord-presence/pull/2)). `loadConfigFile` silently skips `ENOENT` so users who keep only one of `<projectRoot>/.discord-presence.json` or `~/.discord-presence.json` (the common case per the README) no longer see `[discord-presence] Failed to load config file: …` on every startup. Restores the "silent by default" promise.
+
+### Acknowledgements
+
+Thanks to [@festivities](https://github.com/festivities) for the Desktop-compatibility work in [#2](https://github.com/Puri12/opencode-discord-presence/pull/2) — exactly the lifecycle plumbing the multi-CLI features landing next needed.
+
 ## [0.5.2] - 2026-05-28
 
 ### Added

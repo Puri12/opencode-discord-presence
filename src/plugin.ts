@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto"
+import { readFile } from "node:fs/promises"
 import { homedir, hostname } from "node:os"
 import { join } from "node:path"
 import type { Plugin } from "@opencode-ai/plugin"
@@ -42,13 +43,12 @@ async function loadConfigFile(directory: string): Promise<DiscordPresenceOptions
   ]
 
   for (const configPath of paths) {
-    const file = Bun.file(configPath)
-    if (await file.exists()) {
-      try {
-        return (await file.json()) as DiscordPresenceOptions
-      } catch (error) {
-        console.warn("[discord-presence] Failed to load config file:", error)
-      }
+    try {
+      const content = await readFile(configPath, "utf-8")
+      return JSON.parse(content) as DiscordPresenceOptions
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue
+      console.warn("[discord-presence] Failed to load config file:", error)
     }
   }
   return undefined
@@ -458,19 +458,37 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
     ownershipHandler.onOwnership(true)
   }
 
+  /**
+   * Full graceful teardown — invoked by the plugin's `dispose` hook AND by
+   * `SIGINT` / `SIGTERM` fallbacks so any exit path (opencode shutdown,
+   * user `Ctrl+C`, or process kill via signal) releases the primary-plugin
+   * guard, cancels pending settle/recap timers, unlinks the coordinator
+   * heartbeat file, stops the rotation timer, and clears+disconnects the
+   * Discord RPC. Without the signal path, SIGTERM would leave the
+   * coordinator file on disk and the Discord activity stale.
+   */
+  const shutdown = async () => {
+    releasePrimaryPluginInstance()
+    ownershipHandler.cancelPending()
+    cancelPendingRecap()
+    coordinator.stop()
+    stopRotationTimer()
+    if (!rpc) return
+    const current = rpc
+    rpc = null
+    await current.clear()
+    await current.disconnect()
+  }
+
+  process.on("SIGINT", () => {
+    void shutdown()
+  })
+  process.on("SIGTERM", () => {
+    void shutdown()
+  })
+
   return {
-    dispose: async () => {
-      releasePrimaryPluginInstance()
-      ownershipHandler.cancelPending()
-      cancelPendingRecap()
-      coordinator.stop()
-      stopRotationTimer()
-      if (!rpc) return
-      const current = rpc
-      rpc = null
-      await current.clear()
-      await current.disconnect()
-    },
+    dispose: () => shutdown(),
     "chat.message": async (input, _output) => {
       const sessionID = (input as { sessionID?: string }).sessionID ?? ""
       if (await shouldSkipSession(sessionID)) return

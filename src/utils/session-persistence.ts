@@ -1,4 +1,5 @@
 import { mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs"
+import { readFile, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
@@ -65,7 +66,7 @@ export async function saveSessionMetrics(
   }
 
   const json = JSON.stringify(serialized)
-  await Bun.write(filePath, json)
+  await writeFile(filePath, json)
 }
 
 export async function loadSessionMetrics(
@@ -75,13 +76,15 @@ export async function loadSessionMetrics(
   const baseDir = dir ?? join(homedir(), SESSION_DIR)
   const filePath = resolveFile(baseDir, options)
 
-  const file = Bun.file(filePath)
-  if (!(await file.exists())) {
+  let content: string
+  try {
+    content = await readFile(filePath, "utf-8")
+  } catch {
     return null
   }
 
   try {
-    const serialized: SerializedSessionMetrics = await file.json()
+    const serialized: SerializedSessionMetrics = JSON.parse(content)
 
     const isStale = !serialized.savedAt || Date.now() - serialized.savedAt > STALE_THRESHOLD_MS
     if (isStale) {
