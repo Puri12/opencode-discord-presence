@@ -289,6 +289,44 @@ describe("DiscordRPCService", () => {
     })
   })
 
+  describe("setPresence buttons", () => {
+    test("every activity sent to Discord includes the View on GitHub button", () => {
+      const timers = new Map<number, () => void>()
+      let timerId = 0
+      const setTimeoutImpl = (fn: () => void, _delay: number) => {
+        const id = ++timerId
+        timers.set(id, fn)
+        return id
+      }
+      const clearTimeoutImpl = (id: number) => {
+        timers.delete(id)
+      }
+
+      const mockClient = createMockClient()
+      const rpc = new DiscordRPCService("123")
+      // @ts-expect-error — test injection
+      rpc._overrideClient(mockClient)
+      rpc._setConnected(true)
+      rpc._setTimerImpl(
+        setTimeoutImpl as unknown as typeof setTimeout,
+        clearTimeoutImpl as unknown as typeof clearTimeout,
+      )
+
+      rpc.setPresence("details", "state")
+      timers.get(1)?.()
+
+      const activity = mockClient.user.setActivityCalls[0].args[0] as {
+        buttons?: Array<{ label: string; url: string }>
+      }
+      expect(activity.buttons).toEqual([
+        {
+          label: "View on GitHub",
+          url: "https://github.com/Puri12/opencode-discord-presence",
+        },
+      ])
+    })
+  })
+
   describe("reconnect replay guard", () => {
     test("after clear(), currentPresence is null so reconnect cannot replay stale data", async () => {
       const rpc = new DiscordRPCService("123")
