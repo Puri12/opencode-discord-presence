@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-28
+
+### Added
+
+- **OpenCode Desktop compatibility** ([#2](https://github.com/Puri12/opencode-discord-presence/pull/2)). Replaced `Bun.file()` / `Bun.write()` with `node:fs/promises` so the plugin loads inside OpenCode Desktop's Node.js (Electron) sidecar where the global `Bun` is undefined. Plain Node.js APIs work equally well in Bun, so the TUI is unaffected.
+- **Plugin lifecycle hooks** ([#2](https://github.com/Puri12/opencode-discord-presence/pull/2)). Added a `dispose` hook plus `SIGINT` / `SIGTERM` fallbacks that stop the rotation timer, clear the Discord activity, and disconnect the RPC client. Presence no longer lingers on Discord after OpenCode shuts down.
+
+### Fixed
+
+- **Stale presence on graceful shutdown** ([#2](https://github.com/Puri12/opencode-discord-presence/pull/2)). `disconnect()` now explicitly sends `clearActivity` before destroying the RPC client. Combined with the new lifecycle hooks above, this ensures Discord drops the presence card immediately on quit instead of holding the last state indefinitely.
+- **Double `clearActivity` on session recap teardown** (review follow-up on [#2](https://github.com/Puri12/opencode-discord-presence/pull/2)). `disconnect()` now skips the `clearActivity` call when a prior `clear()` already sent one — keeps the recap-cleanup test suite GREEN and avoids hammering Discord with redundant RPC calls.
+- **Spurious warn on first launch without config file** (review follow-up on [#2](https://github.com/Puri12/opencode-discord-presence/pull/2)). `loadConfigFile` silently skips `ENOENT` so users who keep only one of `<projectRoot>/.discord-presence.json` or `~/.discord-presence.json` (the common case per the README) no longer see `[discord-presence] Failed to load config file: …` on every startup. Restores the "silent by default" promise.
+
+### Acknowledgements
+
+Thanks to [@festivities](https://github.com/festivities) for the Desktop-compatibility work in [#2](https://github.com/Puri12/opencode-discord-presence/pull/2) — exactly the lifecycle plumbing the multi-CLI features landing next needed.
+
 ## [0.5.2] - 2026-05-28
 
 ### Added
