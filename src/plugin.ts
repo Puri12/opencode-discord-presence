@@ -167,10 +167,34 @@ export function startPluginAsync(
   }
 }
 
+// Within a single OpenCode process, OpenCode loads this plugin twice when
+// both the project opencode.json and the global config register it (they
+// resolve to the same file path, but OpenCode treats them as separate
+// entries). Each invocation would otherwise create its own RPC client,
+// coordinator, and rotation timer — doubling the connect attempts per PID.
+// With 3+ concurrent CLIs the multiplied attempts (6+ from same clientId)
+// trip Discord's same-application connection throttle, locking out new
+// connections entirely. Dedup at the module level so only the first
+// invocation in a given process is the "primary" plugin; later invocations
+// return empty hooks and do nothing. See issue #11.
+let primaryPluginActive = false
+
+export function isPrimaryPluginInstance(): boolean {
+  if (primaryPluginActive) return false
+  primaryPluginActive = true
+  return true
+}
+
+export function releasePrimaryPluginInstance(): void {
+  primaryPluginActive = false
+}
+
 export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
   const fileOptions = await loadConfigFile(ctx.directory)
   const config = getConfig(fileOptions)
   if (!config.enabled) return {}
+
+  if (!isPrimaryPluginInstance()) return {}
 
   // Instance-scoped RPC service and presence state.
   let rpc: DiscordRPCService | null = new DiscordRPCService(config.clientId, {
@@ -317,6 +341,7 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
 
   return {
     dispose: async () => {
+      releasePrimaryPluginInstance()
       coordinator.stop()
       stopRotationTimer()
       if (!rpc) return

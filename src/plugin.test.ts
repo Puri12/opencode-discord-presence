@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test"
-import { startPluginAsync } from "./plugin.js"
+import {
+  isPrimaryPluginInstance,
+  releasePrimaryPluginInstance,
+  startPluginAsync,
+} from "./plugin.js"
 import type { DiscordRPCService } from "./services/discord-rpc.js"
 import {
   createInitialPresenceState,
@@ -742,6 +746,25 @@ describe("sparse payload tolerance", () => {
     expect(metrics.uniqueFilesTouched.size).toBe(2)
     expect(metrics.lastTaskContext).toBe("Implement feature X")
     expect(metrics.lastFileContext).toBe(file2)
+  })
+})
+
+// ─── primary plugin instance dedup ────────────────────────────────────────────
+
+describe("primary plugin instance dedup", () => {
+  test("first claim succeeds, subsequent claims fail until release", () => {
+    releasePrimaryPluginInstance()
+    expect(isPrimaryPluginInstance()).toBe(true)
+    expect(isPrimaryPluginInstance()).toBe(false)
+    expect(isPrimaryPluginInstance()).toBe(false)
+  })
+
+  test("releasePrimaryPluginInstance allows a fresh claim", () => {
+    releasePrimaryPluginInstance()
+    isPrimaryPluginInstance()
+    releasePrimaryPluginInstance()
+    expect(isPrimaryPluginInstance()).toBe(true)
+    releasePrimaryPluginInstance()
   })
 })
 
