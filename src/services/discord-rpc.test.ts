@@ -404,6 +404,53 @@ describe("DiscordRPCService", () => {
       expect(timers.length).toBe(0)
     })
   })
+
+  describe("clientGeneration (stale-callback race fix)", () => {
+    test("starts at 0 before any connect", () => {
+      const rpc = new DiscordRPCService("123")
+      expect(rpc._getClientGeneration()).toBe(0)
+    })
+
+    test("connect() increments clientGeneration synchronously", () => {
+      const rpc = new DiscordRPCService("123")
+      expect(rpc._getClientGeneration()).toBe(0)
+      void rpc.connect()
+      expect(rpc._getClientGeneration()).toBe(1)
+    })
+
+    test("disconnect() increments clientGeneration to invalidate in-flight handlers", async () => {
+      const rpc = new DiscordRPCService("123")
+      rpc._setConnected(true)
+      const before = rpc._getClientGeneration()
+      await rpc.disconnect()
+      const after = rpc._getClientGeneration()
+      expect(after).toBe(before + 1)
+    })
+
+    test("connect → disconnect → connect bumps generation each step (no zombie state)", () => {
+      const rpc = new DiscordRPCService("123")
+      expect(rpc._getClientGeneration()).toBe(0)
+
+      void rpc.connect()
+      expect(rpc._getClientGeneration()).toBe(1)
+      void rpc.disconnect()
+      expect(rpc._getClientGeneration()).toBe(2)
+
+      void rpc.connect()
+      expect(rpc._getClientGeneration()).toBe(3)
+      void rpc.disconnect()
+      expect(rpc._getClientGeneration()).toBe(4)
+    })
+
+    test("connect() while already connected returns early without bumping generation", async () => {
+      const rpc = new DiscordRPCService("123")
+      rpc._setConnected(true)
+      const before = rpc._getClientGeneration()
+      const result = await rpc.connect()
+      expect(result).toBe(true)
+      expect(rpc._getClientGeneration()).toBe(before)
+    })
+  })
 })
 
 describe("DiscordRPCService logging", () => {

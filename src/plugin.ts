@@ -1,9 +1,11 @@
+import { randomUUID } from "node:crypto"
 import { readFile } from "node:fs/promises"
-import { homedir } from "node:os"
+import { homedir, hostname } from "node:os"
 import { join } from "node:path"
 import type { Plugin } from "@opencode-ai/plugin"
 import { getConfig } from "./config.js"
-import { createRecapCleanupTask, DiscordRPCService } from "./services/discord-rpc.js"
+import { DiscordRPCService } from "./services/discord-rpc.js"
+import { InstanceCoordinator } from "./services/instance-coordinator.js"
 import { PresenceOrchestrator } from "./services/presence-orchestrator.js"
 import { SessionTracker } from "./services/session-tracker.js"
 import {
@@ -29,6 +31,7 @@ import {
 import {
   clearSessionMetrics,
   loadSessionMetrics,
+  pruneStaleSessionMetrics,
   saveSessionMetrics,
 } from "./utils/session-persistence.js"
 import { getToolLabel } from "./utils/tool-label.js"
@@ -64,10 +67,6 @@ interface ToolExecuteOutput {
   metadata?: Record<string, unknown>
 }
 
-/**
- * Captured context from tool.execute.before, keyed by callID for after-hook retrieval.
- * This is the ONLY contract-safe source of executable args for the after-hook.
- */
 type CallIDContext = Map<
   string,
   {
@@ -76,9 +75,6 @@ type CallIDContext = Map<
   }
 >
 
-/**
- * Extracts a normalized file path from tool execute args if it looks like a file path.
- */
 // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: recursive traversal of unknown arg shape needed
 function extractFilePathFromArgs(args?: unknown): string | undefined {
   if (!args) return undefined
@@ -122,9 +118,6 @@ function extractFilePathFromArgs(args?: unknown): string | undefined {
   return undefined
 }
 
-/**
- * Counts how many rotating informational cards are active given the current options.
- */
 function countRotatingCards(
   opts: RichPresenceOptions,
   hasWarnings: boolean,
@@ -138,25 +131,175 @@ function countRotatingCards(
   return Math.max(count, 1)
 }
 
+function sanitizeForFilename(raw: string, fallback: string): string {
+  const sanitized = raw.replace(/[^A-Za-z0-9_-]/g, "_")
+  return sanitized || fallback
+}
+
+/**
+ * Builds the per-machine, per-Discord-app instance election directory.
+ * Hostname segregation keeps shared-HOME setups (NFS, SMB, Dropbox) from
+ * making one machine's CLIs suppress another's. ClientId segregation keeps
+ * users running multiple Discord application IDs from cross-contaminating.
+ */
+export function buildInstancesDir(home: string, host: string, clientId: string): string {
+  const safeHost = sanitizeForFilename(host, "unknown-host")
+  const safeClient = sanitizeForFilename(clientId, "default")
+  return join(home, ".opencode-discord-presence", "instances", safeHost, safeClient)
+}
+
+/**
+ * Settle delay between gaining ownership and calling `rpc.connect()`. Must
+ * exceed the coordinator's tick interval (default 1000ms in instance-coordinator)
+ * so the previous owner has had at least one tick to discover its ownership
+ * loss and run its `rpc.clear()` + `rpc.disconnect()` before the new owner
+ * contends for Discord's IPC socket. Without this slack, a fast handoff
+ * leaves a brief window where A.clear() can erase B's freshly-pushed presence.
+ */
+const DEFAULT_OWNER_SETTLE_MS = 1200
+
+export interface OwnershipHandlerOptions {
+  rpc: Pick<DiscordRPCService, "connect" | "disconnect" | "clear">
+  pushPresence: () => Promise<void>
+  startRotationTimer: () => void
+  stopRotationTimer: () => void
+  isStillOwner: () => boolean
+  settleMs?: number
+  setTimeoutImpl?: typeof setTimeout
+  clearTimeoutImpl?: typeof clearTimeout
+}
+
+export interface OwnershipHandler {
+  onOwnership: (isOwner: boolean) => void
+  cancelPending: () => void
+}
+
+/**
+ * Builds an ownership-change handler with a settle delay before connecting.
+ * Gaining ownership schedules a connect after `settleMs`; losing it cancels
+ * the pending connect and disconnects immediately. The settle window lets
+ * the previous owner finish its disconnect before the new owner contends
+ * for Discord's single IPC socket — without it, rapid ownership flips during
+ * concurrent CLI startup cause connect/disconnect churn and IPC throttling.
+ */
+export function createOwnershipHandler(opts: OwnershipHandlerOptions): OwnershipHandler {
+  const settleMs = opts.settleMs ?? DEFAULT_OWNER_SETTLE_MS
+  const setT = opts.setTimeoutImpl ?? setTimeout
+  const clearT = opts.clearTimeoutImpl ?? clearTimeout
+  let pending: ReturnType<typeof setTimeout> | null = null
+
+  const cancelPending = () => {
+    if (pending) {
+      clearT(pending)
+      pending = null
+    }
+  }
+
+  const onOwnership = (isOwner: boolean): void => {
+    cancelPending()
+    if (isOwner) {
+      pending = setT(() => {
+        pending = null
+        if (!opts.isStillOwner()) return
+        opts.startRotationTimer()
+        void opts.pushPresence()
+        opts.rpc.connect().catch(() => {})
+      }, settleMs)
+      pending?.unref?.()
+    } else {
+      opts.stopRotationTimer()
+      void opts.rpc.clear()
+      void opts.rpc.disconnect()
+    }
+  }
+
+  return { onOwnership, cancelPending }
+}
+
+const DEFAULT_RECAP_DELAY_MS = 30_000
+
+export interface RecapSchedulerOptions {
+  clearRecapState: () => void
+  delayMs?: number
+  setTimeoutImpl?: typeof setTimeout
+  clearTimeoutImpl?: typeof clearTimeout
+}
+
+export interface RecapScheduler {
+  schedule: () => void
+  flushNow: () => void
+  cancel: () => void
+}
+
+/**
+ * Owns the lifecycle of the post-session recap card. The recap is purely a
+ * visual state on the snapshot — the RPC lifecycle stays tied to ownership,
+ * not the recap. After `delayMs`, the recap state is cleared so rotation no
+ * longer surfaces the recap card. `flushNow()` clears immediately (used by
+ * any user activity that should resume normal presence); `cancel()` drops
+ * the pending clear without running it (used on dispose).
+ */
+export function createRecapScheduler(opts: RecapSchedulerOptions): RecapScheduler {
+  const setT = opts.setTimeoutImpl ?? setTimeout
+  const clearT = opts.clearTimeoutImpl ?? clearTimeout
+  const delayMs = opts.delayMs ?? DEFAULT_RECAP_DELAY_MS
+
+  let timer: ReturnType<typeof setTimeout> | null = null
+  let pending = false
+
+  const runOnce = (): void => {
+    if (!pending) return
+    pending = false
+    opts.clearRecapState()
+  }
+
+  const schedule = (): void => {
+    if (timer) clearT(timer)
+    pending = true
+    timer = setT(() => {
+      timer = null
+      runOnce()
+    }, delayMs)
+    timer?.unref?.()
+  }
+
+  const flushNow = (): void => {
+    if (timer) {
+      clearT(timer)
+      timer = null
+    }
+    runOnce()
+  }
+
+  const cancel = (): void => {
+    if (timer) {
+      clearT(timer)
+      timer = null
+    }
+    pending = false
+  }
+
+  return { schedule, flushNow, cancel }
+}
+
 /**
  * Kicks off plugin runtime side-effects WITHOUT blocking on the initial
  * Discord connection. OpenCode awaits the plugin init promise during
  * bootstrap, so the IPC timeout (~10s when Discord is closed) used to
- * stall the entire UI. The MCP-style lazy approach:
- *   1) start the rotation timer immediately (no-op pushes are harmless),
- *   2) queue initial presence locally — the RPC service replays
- *      `currentPresence` from its 'ready' handler on every successful
- *      connect, including via `scheduleReconnect()`,
- *   3) fire `connect()` fire-and-forget; the catch swallows the
- *      defensive case where connect() ever rejects (the current
- *      implementation always resolves, but we don't want a future
- *      refactor to surface an unhandled rejection here).
+ * stall the entire UI. We:
+ *   1) early-return when this instance is not the owner (rotation +
+ *      presence are no-ops anyway, and we don't want a stray timer
+ *      keeping the event loop alive),
+ *   2) start the rotation timer for the owner,
+ *   3) queue initial presence locally and fire `connect()` fire-and-forget.
  */
 export function startPluginAsync(
   rpc: Pick<DiscordRPCService, "isConnected" | "connect">,
   pushPresence: () => Promise<void>,
   startRotationTimer: () => void,
+  isOwner: () => boolean = () => true,
 ): void {
+  if (!isOwner()) return
   startRotationTimer()
   void pushPresence()
   if (!rpc.isConnected()) {
@@ -164,48 +307,63 @@ export function startPluginAsync(
   }
 }
 
+let primaryPluginActive = false
+
+export function isPrimaryPluginInstance(): boolean {
+  if (primaryPluginActive) return false
+  primaryPluginActive = true
+  return true
+}
+
+export function releasePrimaryPluginInstance(): void {
+  primaryPluginActive = false
+}
+
 export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
   const fileOptions = await loadConfigFile(ctx.directory)
   const config = getConfig(fileOptions)
   if (!config.enabled) return {}
 
-  // Instance-scoped RPC service and presence state.
+  if (!isPrimaryPluginInstance()) return {}
+
+  const instanceId = randomUUID()
+
   let rpc: DiscordRPCService | null = new DiscordRPCService(config.clientId, {
     debug: config.debug,
   })
   let snapshot = createInitialPresenceState()
 
-  // Multi-agent state machine: tracks busy/idle across all chat.message sessions
-  // so idle text appears only when every tracked session reports idle.
   const orchestrator = new PresenceOrchestrator()
 
-  // Session kind tracker (main vs sub-agent). Only consulted when mainAgentOnly
-  // is enabled — primed via session.created / session.updated events for sync
-  // peek(), with async resolve() fallback through the OpenCode SDK.
   const tracker = new SessionTracker(ctx.client)
   const mainAgentOnly = config.richPresence.mainAgentOnly
 
-  // Contract-safe before/after hook state: callID-scoped context captured in before, retrieved in after.
-  // This is the ONLY safe way to pass executable args from before→after since after.output lacks args.
   const callContext: CallIDContext = new Map()
 
-  // Session metrics tracked separately due to Set serialization in SessionMetrics
   let sessionMetricsState: SessionMetricsState = createSessionMetricsState()
-  // Try to restore session metrics from previous session (e.g., after crash or restart)
-  const persisted = await loadSessionMetrics()
+  const persisted = await loadSessionMetrics(undefined, { instanceId })
   if (persisted) {
     sessionMetricsState = persisted
   }
 
-  // Rotation state
+  void pruneStaleSessionMetrics(undefined, { keepInstanceId: instanceId })
+
   let rotationIndex = 0
   let rotationTimer: ReturnType<typeof setInterval> | null = null
+  let activeRecapScheduler: RecapScheduler | null = null
 
-  /**
-   * Returns true if a sessionID is a sub-agent that should be skipped under
-   * mainAgentOnly. Uses cached peek first; if unknown, async-resolves via SDK.
-   * When mainAgentOnly is disabled, always returns false (process everything).
-   */
+  const exitRecapIfNeeded = (): void => {
+    if (!activeRecapScheduler) return
+    activeRecapScheduler.flushNow()
+    activeRecapScheduler = null
+  }
+
+  const cancelPendingRecap = (): void => {
+    if (!activeRecapScheduler) return
+    activeRecapScheduler.cancel()
+    activeRecapScheduler = null
+  }
+
   const shouldSkipSession = async (sessionID: string | undefined): Promise<boolean> => {
     if (!mainAgentOnly || !sessionID) return false
     const peeked = tracker.peek(sessionID)
@@ -215,11 +373,6 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
     return resolved === "sub"
   }
 
-  /**
-   * Synchronous fast-path skip check used in high-frequency tool hooks. When
-   * the session is "unknown" we kick off an async resolve and let THIS event
-   * through so we do not block file-spotlight updates on SDK latency.
-   */
   const shouldSkipSessionSync = (sessionID: string | undefined): boolean => {
     if (!mainAgentOnly || !sessionID) return false
     const peeked = tracker.peek(sessionID)
@@ -230,12 +383,14 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
     return false
   }
 
-  /**
-   * Pushes the current snapshot + live metrics to Discord via the rotation engine.
-   */
+  const coordinator = new InstanceCoordinator({
+    instancesDir: buildInstancesDir(homedir(), hostname(), config.clientId),
+    instanceId,
+  })
+
   const pushPresence = async () => {
     if (!rpc) return
-    // Derive sessionMetrics from live metrics state for every Discord push
+    if (!coordinator.isOwner()) return
     const snapshotWithMetrics: PresenceSnapshot = {
       ...snapshot,
       sessionMetrics: sessionMetricsState,
@@ -252,9 +407,6 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
     )
   }
 
-  /**
-   * Starts the rotation timer for informational cards.
-   */
   const startRotationTimer = () => {
     if (rotationTimer) clearInterval(rotationTimer)
     const intervalMs = config.richPresence.rotationIntervalSeconds * 1000
@@ -268,11 +420,9 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
         )
       await pushPresence()
     }, intervalMs)
+    rotationTimer?.unref?.()
   }
 
-  /**
-   * Stops the rotation timer.
-   */
   const stopRotationTimer = () => {
     if (rotationTimer) {
       clearInterval(rotationTimer)
@@ -280,22 +430,48 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
     }
   }
 
-  /**
-   * Exits idle mode if currently idle — called on any active event.
-   */
   const exitIdleIfNeeded = async () => {
     if (snapshot.idle) {
       snapshot = presenceReducer(snapshot, updateIdle(false))
     }
   }
 
-  startPluginAsync(rpc, pushPresence, startRotationTimer)
+  const ownershipHandler = createOwnershipHandler({
+    rpc: {
+      connect: () => rpc?.connect() ?? Promise.resolve(false),
+      disconnect: () => rpc?.disconnect() ?? Promise.resolve(),
+      clear: () => rpc?.clear() ?? Promise.resolve(),
+    },
+    pushPresence,
+    startRotationTimer,
+    stopRotationTimer,
+    isStillOwner: () => coordinator.isOwner(),
+  })
+
+  coordinator.onOwnershipChange((isOwner) => {
+    if (!isOwner) cancelPendingRecap()
+    ownershipHandler.onOwnership(isOwner)
+  })
+  coordinator.start()
+
+  if (coordinator.isOwner()) {
+    ownershipHandler.onOwnership(true)
+  }
 
   /**
-   * Clears the Discord activity and disconnects the RPC client.
-   * Called on graceful shutdown (dispose hook) and as a signal fallback.
+   * Full graceful teardown — invoked by the plugin's `dispose` hook AND by
+   * `SIGINT` / `SIGTERM` fallbacks so any exit path (opencode shutdown,
+   * user `Ctrl+C`, or process kill via signal) releases the primary-plugin
+   * guard, cancels pending settle/recap timers, unlinks the coordinator
+   * heartbeat file, stops the rotation timer, and clears+disconnects the
+   * Discord RPC. Without the signal path, SIGTERM would leave the
+   * coordinator file on disk and the Discord activity stale.
    */
   const shutdown = async () => {
+    releasePrimaryPluginInstance()
+    ownershipHandler.cancelPending()
+    cancelPendingRecap()
+    coordinator.stop()
     stopRotationTimer()
     if (!rpc) return
     const current = rpc
@@ -313,10 +489,12 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
 
   return {
     dispose: () => shutdown(),
-    // ── chat.message ────────────────────────────────────────────────────────────
     "chat.message": async (input, _output) => {
       const sessionID = (input as { sessionID?: string }).sessionID ?? ""
       if (await shouldSkipSession(sessionID)) return
+
+      coordinator.recordActivity({ flush: true })
+      exitRecapIfNeeded()
 
       const agent = input.agent ?? snapshot.identity.agent
       const model = input.model?.modelID ?? snapshot.identity.model
@@ -333,25 +511,22 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
       )
 
       sessionMetricsState = recordMessageActivity(sessionMetricsState)
-      await saveSessionMetrics(sessionMetricsState)
+      await saveSessionMetrics(sessionMetricsState, undefined, { instanceId })
 
       await exitIdleIfNeeded()
 
       await pushPresence()
     },
 
-    // ── tool.execute.before ───────────────────────────────────────────────────
     "tool.execute.before": async (input: ToolExecuteInput, output: ToolExecuteOutput) => {
       if (shouldSkipSessionSync(input.sessionID)) return
 
       const toolName = input.tool ?? ""
       const callID = input.callID ?? ""
       const filePath = extractFilePathFromArgs(output.args)
-      // Infer operation label with command context from args for bash commands
       const command = typeof output.args === "string" ? output.args : undefined
       const operation = getToolLabel({ toolName, command })
 
-      // Capture context for after-hook retrieval via callID (contract-safe args path)
       if (callID) {
         callContext.set(callID, { filePath, operation })
       }
@@ -362,7 +537,7 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
           updateFileAction({ file: filePath, action: toolName, operation }),
         )
         sessionMetricsState = recordFileTouch(sessionMetricsState, filePath)
-        await saveSessionMetrics(sessionMetricsState)
+        await saveSessionMetrics(sessionMetricsState, undefined, { instanceId })
       } else {
         snapshot = presenceReducer(snapshot, updateFileAction({ action: toolName, operation }))
       }
@@ -371,21 +546,16 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
       await pushPresence()
     },
 
-    // ── tool.execute.after ────────────────────────────────────────────────────
-    // IMPORTANT: output.shape is { title, output, metadata } — NO args field per contract.
-    // File context is retrieved from before-hook capture via callID (the ONLY contract-safe path).
     "tool.execute.after": async (input: ToolExecuteInput, _output: ToolExecuteOutput) => {
       if (shouldSkipSessionSync(input.sessionID)) return
 
       const toolName = input.tool ?? ""
       const callID = input.callID ?? ""
 
-      // Retrieve captured context from before-hook (contract-safe args source)
       const captured = callContext.get(callID)
       const filePath = captured?.filePath
       const operation = captured?.operation ?? getToolLabel({ toolName })
 
-      // Clean up captured context after retrieval to avoid memory leak
       if (callID) {
         callContext.delete(callID)
       }
@@ -396,7 +566,7 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
           updateFileAction({ file: filePath, action: toolName, operation }),
         )
         sessionMetricsState = recordFileTouch(sessionMetricsState, filePath)
-        await saveSessionMetrics(sessionMetricsState)
+        await saveSessionMetrics(sessionMetricsState, undefined, { instanceId })
       } else {
         snapshot = presenceReducer(snapshot, updateFileAction({ action: toolName, operation }))
       }
@@ -405,12 +575,10 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
       await pushPresence()
     },
 
-    // ── Generic event hook ────────────────────────────────────────────────────
     // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: event dispatch pattern requires all branches
     event: async ({ event }) => {
       const eventType = event.type
 
-      // ── session.created / session.updated — prime tracker with parentID ──
       if (eventType === "session.created" || eventType === "session.updated") {
         const info = (event.properties as { info?: { id?: string; parentID?: string | null } })
           ?.info
@@ -420,7 +588,6 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
         return
       }
 
-      // ── session.status — busy/idle lifecycle for the orchestrator ────────
       if (eventType === "session.status") {
         const props = event.properties as {
           sessionID?: string
@@ -448,7 +615,6 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
         return
       }
 
-      // ── file.edited ───────────────────────────────────────────────────────
       if (eventType === "file.edited") {
         const filePath = (event.properties as { file?: string } | undefined)?.file
         if (filePath) {
@@ -462,14 +628,13 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
             }),
           )
           sessionMetricsState = recordFileTouch(sessionMetricsState, normalized)
-          await saveSessionMetrics(sessionMetricsState)
+          await saveSessionMetrics(sessionMetricsState, undefined, { instanceId })
         }
         await exitIdleIfNeeded()
         await pushPresence()
         return
       }
 
-      // ── todo.updated ──────────────────────────────────────────────────────
       if (eventType === "todo.updated") {
         const props = event.properties as
           | {
@@ -507,7 +672,7 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
 
           if (activeTaskLabel) {
             sessionMetricsState = recordTaskContext(sessionMetricsState, activeTaskLabel)
-            await saveSessionMetrics(sessionMetricsState)
+            await saveSessionMetrics(sessionMetricsState, undefined, { instanceId })
           }
         }
 
@@ -516,11 +681,7 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
         return
       }
 
-      // ── lsp.client.diagnostics ─────────────────────────────────────────────
       if (eventType === "lsp.client.diagnostics") {
-        // lsp.client.diagnostics is a notification that diagnostics changed for a path.
-        // The OpenCode plugin API does not provide error/warning counts through this event.
-        // We cannot implement the diagnostics-error pin in v1 from this event alone.
         ctx.client.app.log({
           body: {
             service: "discord-presence",
@@ -531,7 +692,6 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
         return
       }
 
-      // ── session.idle ──────────────────────────────────────────────────────
       if (eventType === "session.idle") {
         const sessionID = (event.properties as { sessionID?: string }).sessionID ?? ""
         if (await shouldSkipSession(sessionID)) return
@@ -546,23 +706,16 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
         return
       }
 
-      // ── session.deleted ───────────────────────────────────────────────────
       if (eventType === "session.deleted") {
         const deletedID = (event.properties as { info?: { id?: string } }).info?.id ?? ""
         const wasMainOrTracked = !mainAgentOnly || tracker.peek(deletedID) === "main"
         orchestrator.markIdle(deletedID)
         tracker.forget(deletedID)
 
-        // Sub-agent deletions in mainAgentOnly mode never owned presence, so
-        // they should not trigger the session recap — that would steal the
-        // user's main-session card and tear down RPC mid-conversation.
         if (!wasMainOrTracked) return
 
-        stopRotationTimer()
-
-        // Build recap from accumulated metrics
         const recap = createSessionRecap(sessionMetricsState)
-        await clearSessionMetrics()
+        await clearSessionMetrics(undefined, { instanceId })
         snapshot = presenceReducer(
           snapshot,
           updateRecapCache({
@@ -573,22 +726,20 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
 
         await pushPresence()
 
-        const recapRpc = rpc
-        rpc = null
-        const clearRecap = () => {
-          snapshot = presenceReducer(snapshot, updateRecapCache({}))
-        }
-        const cleanupRecap = createRecapCleanupTask(recapRpc, clearRecap)
-
-        // After 30 seconds, clear recap state and tear down the specific RPC session
-        setTimeout(() => {
-          void cleanupRecap()
-        }, 30_000)
+        cancelPendingRecap()
+        const scheduler = createRecapScheduler({
+          clearRecapState: () => {
+            snapshot = { ...snapshot, recapCache: {} }
+            activeRecapScheduler = null
+            void pushPresence()
+          },
+        })
+        activeRecapScheduler = scheduler
+        scheduler.schedule()
 
         return
       }
 
-      // ── Unknown event type (non-crashing fallback) ──────────────────────────
       ctx.client.app.log({
         body: {
           service: "discord-presence",
