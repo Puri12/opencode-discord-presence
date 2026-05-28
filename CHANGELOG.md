@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-05-28
+
+### Fixed
+
+- **Retry-cycle log spam** ([#7](https://github.com/Puri12/opencode-discord-presence/issues/7), [#8](https://github.com/Puri12/opencode-discord-presence/pull/8)). `scheduleReconnect()` re-enters `connect()` every 5 s and the `.catch` re-emitted the identical `[discord-presence] Connection failed:` log on each retry — `MAX_RETRIES=10` produced **11 identical lines** plus the final "Max retries reached" per blocked startup. New exported helper `shouldLogConnectFailure(retryCount)` gates the log to `retryCount === 0` so retries stay silent. With the 0.7.0 multi-CLI handoff + 1.2 s settle delay, transient connect contention is expected during ownership flips — this fix prevents those normal retries from filling the console. Net log output: **11 lines → 1 line** per blocked startup.
+
+- **`loadConfigFile` `console.warn` bypasses the debug gate** ([#8](https://github.com/Puri12/opencode-discord-presence/pull/8)). `console.warn("[discord-presence] Failed to load config file:", error)` on JSON parse failure ran unconditionally — the leak bypassed the entire `debug` gate because the `debug` flag itself lives in the config that failed to parse (chicken-and-egg). Malformed configs now silently fall back to defaults, matching the README's "silent by default" promise. Users can verify their config by passing the file through any JSON validator.
+
 ## [0.7.0] - 2026-05-28
 
 ### Added
