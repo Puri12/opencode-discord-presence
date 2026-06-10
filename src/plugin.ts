@@ -285,6 +285,37 @@ export function createRecapScheduler(opts: RecapSchedulerOptions): RecapSchedule
   return { schedule, flushNow, cancel }
 }
 
+export interface RotationTickerOptions {
+  getRotationIndex: () => number
+  setRotationIndex: (index: number) => void
+  countCards: () => number
+  pushPresence: () => Promise<void>
+  onError: (error: unknown) => void
+}
+
+export interface RotationTicker {
+  tick: () => Promise<void>
+}
+
+export function createRotationTicker(opts: RotationTickerOptions): RotationTicker {
+  let inFlight = false
+
+  const tick = async (): Promise<void> => {
+    if (inFlight) return
+    inFlight = true
+    try {
+      opts.setRotationIndex((opts.getRotationIndex() + 1) % opts.countCards())
+      await opts.pushPresence()
+    } catch (error) {
+      opts.onError(error)
+    } finally {
+      inFlight = false
+    }
+  }
+
+  return { tick }
+}
+
 /**
  * Kicks off plugin runtime side-effects WITHOUT blocking on the initial
  * Discord connection. OpenCode awaits the plugin init promise during
@@ -432,19 +463,23 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
   const startRotationTimer = () => {
     if (rotationTimer) clearInterval(rotationTimer)
     const intervalMs = config.richPresence.rotationIntervalSeconds * 1000
-    rotationTimer = setInterval(
-      guard("rotation timer", async () => {
-        rotationIndex =
-          (rotationIndex + 1) %
-          countRotatingCards(
-            config.richPresence,
-            snapshot.diagnosticsSummary.warnings > 0,
-            snapshot.diagnosticsSummary.errors,
-          )
-        await pushPresence()
-      }),
-      intervalMs,
-    )
+    const ticker = createRotationTicker({
+      getRotationIndex: () => rotationIndex,
+      setRotationIndex: (index) => {
+        rotationIndex = index
+      },
+      countCards: () =>
+        countRotatingCards(
+          config.richPresence,
+          snapshot.diagnosticsSummary.warnings > 0,
+          snapshot.diagnosticsSummary.errors,
+        ),
+      pushPresence,
+      onError: (error) => warnDebug("rotation timer", error),
+    })
+    rotationTimer = setInterval(() => {
+      void ticker.tick()
+    }, intervalMs)
     rotationTimer?.unref?.()
   }
 

@@ -6,6 +6,7 @@ import {
   buildInstancesDir,
   createOwnershipHandler,
   createRecapScheduler,
+  createRotationTicker,
   isPrimaryPluginInstance,
   OpenCodeDiscordPresence,
   releasePrimaryPluginInstance,
@@ -1281,5 +1282,79 @@ describe("createRecapScheduler", () => {
     expect(cleared()).toBe(1)
     scheduler.flushNow()
     expect(cleared()).toBe(1)
+  })
+})
+
+describe("createRotationTicker", () => {
+  test("rotation timer skips ticks while a push is in flight", async () => {
+    let rotationIndex = 0
+    let entered = 0
+    let releasePush: (() => void) | undefined
+
+    const ticker = createRotationTicker({
+      getRotationIndex: () => rotationIndex,
+      setRotationIndex: (next) => {
+        rotationIndex = next
+      },
+      countCards: () => 3,
+      pushPresence: async () => {
+        entered++
+        await new Promise<void>((resolve) => {
+          releasePush = resolve
+        })
+      },
+      onError: () => {},
+    })
+
+    const firstTick = ticker.tick()
+    const skippedSecondTick = ticker.tick()
+    const skippedThirdTick = ticker.tick()
+
+    await Promise.resolve()
+
+    expect(entered).toBe(1)
+    expect(rotationIndex).toBe(1)
+
+    releasePush?.()
+    await firstTick
+    await skippedSecondTick
+    await skippedThirdTick
+
+    const nextTick = ticker.tick()
+    await Promise.resolve()
+
+    expect(entered).toBe(2)
+    expect(rotationIndex).toBe(2)
+
+    releasePush?.()
+    await nextTick
+  })
+
+  test("rotation timer catches push rejections and allows later ticks", async () => {
+    let entered = 0
+    let errors = 0
+    let rotationIndex = 0
+
+    const ticker = createRotationTicker({
+      getRotationIndex: () => rotationIndex,
+      setRotationIndex: (next) => {
+        rotationIndex = next
+      },
+      countCards: () => 3,
+      pushPresence: async () => {
+        entered++
+        if (entered === 1) throw new Error("push failed")
+      },
+      onError: () => {
+        errors++
+      },
+    })
+
+    await ticker.tick()
+    await ticker.tick()
+
+    expect(entered).toBe(2)
+    expect(errors).toBe(1)
+    expect(rotationIndex).toBe(2)
   })
 })

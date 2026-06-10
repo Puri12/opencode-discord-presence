@@ -4,8 +4,11 @@ import type { Language, RichPresenceOptions, SetActivity } from "../types/index.
 import { getActivity } from "../utils/activity-rotation.js"
 
 const RECONNECT_DELAY = 5000
+const MAX_RECONNECT_DELAY = 60000
+const RECONNECT_JITTER_RATIO = 0.2
 const MAX_RETRIES = 10
 const DEBOUNCE_MS = 100
+export const MIN_UPDATE_GAP_MS = 2000
 const MAX_DETAILS_LENGTH = 126
 const MAX_STATE_LENGTH = 126
 
@@ -89,6 +92,7 @@ export class DiscordRPCService {
   // ── Debounce state ──────────────────────────────────────────────────────
   private pendingUpdate: SetActivity | null = null
   private debounceTimer: ReturnType<typeof setTimeout> | null = null
+  private lastFlushAt = 0
 
   // ── Reconnect timer ─────────────────────────────────────────────────────
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -96,6 +100,7 @@ export class DiscordRPCService {
   // ── Timer injection (for testing) ───────────────────────────────────────
   private _setTimeoutImpl: typeof setTimeout = setTimeout
   private _clearTimeoutImpl: typeof clearTimeout = clearTimeout
+  private _randomImpl: () => number = Math.random
 
   constructor(
     private clientId: string,
@@ -123,6 +128,10 @@ export class DiscordRPCService {
     this._clearTimeoutImpl = clearTimeoutImpl
   }
 
+  _setRandomImpl(randomImpl: () => number) {
+    this._randomImpl = randomImpl
+  }
+
   _getState() {
     return {
       connected: this.connected,
@@ -132,6 +141,7 @@ export class DiscordRPCService {
       hasPendingUpdate: this.pendingUpdate !== null,
       hasDebounceTimer: this.debounceTimer !== null,
       hasCurrentPresence: this.currentPresence !== null,
+      lastFlushAt: this.lastFlushAt,
     }
   }
 
@@ -297,8 +307,15 @@ export class DiscordRPCService {
     this.reconnectTimer = this._setTimeoutImpl(() => {
       this.reconnectTimer = null
       this.connect()
-    }, RECONNECT_DELAY)
+    }, this.getReconnectDelay())
     this.reconnectTimer.unref?.()
+  }
+
+  private getReconnectDelay(): number {
+    const exponent = Math.max(0, this.retryCount - 1)
+    const baseDelay = Math.min(RECONNECT_DELAY * 2 ** exponent, MAX_RECONNECT_DELAY)
+    const jitter = 1 + (this._randomImpl() * 2 - 1) * RECONNECT_JITTER_RATIO
+    return Math.round(baseDelay * jitter)
   }
 
   // ─── Presence updates (debounced) ─────────────────────────────────────
@@ -334,10 +351,15 @@ export class DiscordRPCService {
     this.pendingUpdate = activity
     if (this.debounceTimer) return
 
+    const now = Date.now()
+    const elapsedSinceFlush = now - this.lastFlushAt
+    const delay =
+      elapsedSinceFlush >= MIN_UPDATE_GAP_MS ? DEBOUNCE_MS : MIN_UPDATE_GAP_MS - elapsedSinceFlush
+
     this.debounceTimer = this._setTimeoutImpl(() => {
       this.debounceTimer = null
       this.flushPendingUpdate()
-    }, DEBOUNCE_MS)
+    }, delay)
     this.debounceTimer.unref?.()
   }
 
@@ -347,6 +369,7 @@ export class DiscordRPCService {
 
     const activity = this.pendingUpdate
     this.pendingUpdate = null
+    this.lastFlushAt = Date.now()
 
     try {
       this.client.user.setActivity(activity).catch((err) => {

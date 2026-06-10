@@ -306,6 +306,144 @@ describe("DiscordRPCService", () => {
       }
       expect(lastCall.details).toBe("Activity 3")
     })
+
+    test("10 rapid setPresence calls within the gap produce at most 2 setActivity invocations and the last payload wins", () => {
+      const originalNow = Date.now
+      Date.now = () => 1_000_000
+      const timers = new Map<number, { fn: () => void; delay: number }>()
+      let timerId = 0
+      const setTimeoutImpl = (fn: () => void, delay: number) => {
+        const id = ++timerId
+        timers.set(id, { fn, delay })
+        return id
+      }
+      const clearTimeoutImpl = (id: number) => {
+        timers.delete(id)
+      }
+
+      const mockClient = createMockClient()
+      const rpc = new DiscordRPCService("123")
+      // @ts-expect-error — test injection
+      rpc._overrideClient(mockClient)
+      rpc._setConnected(true)
+      rpc._setTimerImpl(
+        setTimeoutImpl as unknown as typeof setTimeout,
+        clearTimeoutImpl as unknown as typeof clearTimeout,
+      )
+
+      try {
+        rpc.setPresence("Activity 1", "state1")
+        timers.get(1)?.fn()
+        timers.delete(1)
+
+        for (let i = 2; i <= 10; i++) {
+          rpc.setPresence(`Activity ${i}`, `state${i}`)
+        }
+
+        expect(mockClient.user.setActivityCalls.length).toBe(1)
+        expect(timers.size).toBe(1)
+        const trailing = [...timers.values()][0]
+        expect(trailing.delay).toBe(2000)
+        trailing.fn()
+
+        expect(mockClient.user.setActivityCalls.length).toBeLessThanOrEqual(2)
+        const lastCall = mockClient.user.setActivityCalls[
+          mockClient.user.setActivityCalls.length - 1
+        ].args[0] as {
+          details: string
+          state: string
+        }
+        expect(lastCall.details).toBe("Activity 10")
+        expect(lastCall.state).toBe("state10")
+      } finally {
+        Date.now = originalNow
+      }
+    })
+
+    test("a setPresence after a quiet period flushes fast within the short debounce", () => {
+      const timers = new Map<number, { fn: () => void; delay: number }>()
+      let timerId = 0
+      const setTimeoutImpl = (fn: () => void, delay: number) => {
+        const id = ++timerId
+        timers.set(id, { fn, delay })
+        return id
+      }
+      const clearTimeoutImpl = (id: number) => {
+        timers.delete(id)
+      }
+
+      const mockClient = createMockClient()
+      const rpc = new DiscordRPCService("123")
+      // @ts-expect-error — test injection
+      rpc._overrideClient(mockClient)
+      rpc._setConnected(true)
+      rpc._setTimerImpl(
+        setTimeoutImpl as unknown as typeof setTimeout,
+        clearTimeoutImpl as unknown as typeof clearTimeout,
+      )
+
+      rpc.setPresence("Quiet Activity", "state")
+
+      expect(timers.size).toBe(1)
+      const fast = [...timers.values()][0]
+      expect(fast.delay).toBe(100)
+      fast.fn()
+      expect(mockClient.user.setActivityCalls.length).toBe(1)
+    })
+  })
+
+  describe("reconnect backoff", () => {
+    test("reconnect delays grow exponentially and are capped at 60s", () => {
+      const delays: number[] = []
+      const setTimeoutImpl = (fn: () => void, delay: number) => {
+        delays.push(delay)
+        return { unref: () => {}, fn }
+      }
+      const clearTimeoutImpl = (_id: unknown) => {}
+
+      const rpc = new DiscordRPCService("123")
+      rpc._setTimerImpl(
+        setTimeoutImpl as unknown as typeof setTimeout,
+        clearTimeoutImpl as unknown as typeof clearTimeout,
+      )
+      ;(rpc as unknown as { _setRandomImpl: (fn: () => number) => void })._setRandomImpl(() => 0.5)
+
+      void rpc.connect()
+      for (let i = 0; i < 6; i++) {
+        constructedClients[0]._handlers.disconnected()
+      }
+
+      expect(delays).toEqual([5000, 10000, 20000, 40000, 60000, 60000])
+    })
+
+    test("jitter spreads delays within ±20%", () => {
+      const delays: number[] = []
+      const setTimeoutImpl = (fn: () => void, delay: number) => {
+        delays.push(delay)
+        return { unref: () => {}, fn }
+      }
+      const clearTimeoutImpl = (_id: unknown) => {}
+
+      const low = new DiscordRPCService("123")
+      low._setTimerImpl(
+        setTimeoutImpl as unknown as typeof setTimeout,
+        clearTimeoutImpl as unknown as typeof clearTimeout,
+      )
+      ;(low as unknown as { _setRandomImpl: (fn: () => number) => void })._setRandomImpl(() => 0)
+      void low.connect()
+      constructedClients[constructedClients.length - 1]._handlers.disconnected()
+
+      const high = new DiscordRPCService("123")
+      high._setTimerImpl(
+        setTimeoutImpl as unknown as typeof setTimeout,
+        clearTimeoutImpl as unknown as typeof clearTimeout,
+      )
+      ;(high as unknown as { _setRandomImpl: (fn: () => number) => void })._setRandomImpl(() => 1)
+      void high.connect()
+      constructedClients[constructedClients.length - 1]._handlers.disconnected()
+
+      expect(delays).toEqual([4000, 6000])
+    })
   })
 
   describe("connect failure log gating", () => {
