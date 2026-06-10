@@ -19,18 +19,6 @@ const PRESENCE_BUTTONS: NonNullable<SetActivity["buttons"]> = [
   },
 ]
 
-export function createRecapCleanupTask(
-  rpc: DiscordRPCService | null,
-  clearRecapState: () => void,
-): () => Promise<void> {
-  return async () => {
-    clearRecapState()
-    if (!rpc) return
-    await rpc.clear()
-    await rpc.disconnect()
-  }
-}
-
 function truncate(str: string, maxLen: number): string {
   if (str.length <= maxLen) return str
   return `${str.slice(0, maxLen - 1)}…`

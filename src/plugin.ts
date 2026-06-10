@@ -21,6 +21,7 @@ import {
   updateTodoSummary,
 } from "./state/presence-state.js"
 import type { RichPresenceOptions } from "./types/index.js"
+import { buildRotatingCards } from "./utils/activity-rotation.js"
 import { extractFilePathFromArgs } from "./utils/arg-paths.js"
 import {
   createSessionMetricsState,
@@ -60,42 +61,13 @@ type CallIDContext = Map<
   }
 >
 
+/** Card count derived from the renderer's own card list — no drift possible. */
 function countRotatingCards(
   opts: RichPresenceOptions,
   hasWarnings: boolean,
   errors: number,
 ): number {
-  let count = 0
-  if (opts.enableFileSpotlight) count++
-  if (opts.enableMissionBoard) count++
-  if (hasWarnings && errors === 0) count++
-  count++ // session-stats always present as ultimate fallback
-  return Math.max(count, 1)
-}
-
-/**
- * Kicks off plugin runtime side-effects WITHOUT blocking on the initial
- * Discord connection. OpenCode awaits the plugin init promise during
- * bootstrap, so the IPC timeout (~10s when Discord is closed) used to
- * stall the entire UI. We:
- *   1) early-return when this instance is not the owner (rotation +
- *      presence are no-ops anyway, and we don't want a stray timer
- *      keeping the event loop alive),
- *   2) start the rotation timer for the owner,
- *   3) queue initial presence locally and fire `connect()` fire-and-forget.
- */
-export function startPluginAsync(
-  rpc: Pick<DiscordRPCService, "isConnected" | "connect">,
-  pushPresence: () => Promise<void>,
-  startRotationTimer: () => void,
-  isOwner: () => boolean = () => true,
-): void {
-  if (!isOwner()) return
-  startRotationTimer()
-  void pushPresence()
-  if (!rpc.isConnected()) {
-    rpc.connect().catch(() => {})
-  }
+  return Math.max(buildRotatingCards(opts, hasWarnings, errors).length, 1)
 }
 
 let primaryPluginActive = false

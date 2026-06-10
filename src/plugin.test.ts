@@ -9,7 +9,6 @@ import {
   isPrimaryPluginInstance,
   OpenCodeDiscordPresence,
   releasePrimaryPluginInstance,
-  startPluginAsync,
 } from "./plugin.js"
 import type { DiscordRPCService } from "./services/discord-rpc.js"
 import {
@@ -806,108 +805,6 @@ describe("primary plugin instance dedup", () => {
     releasePrimaryPluginInstance()
     expect(isPrimaryPluginInstance()).toBe(true)
     releasePrimaryPluginInstance()
-  })
-})
-
-// ─── startPluginAsync (non-blocking init) ─────────────────────────────────────
-
-describe("startPluginAsync — non-blocking init", () => {
-  test("returns synchronously without awaiting connect even when Discord is unreachable", () => {
-    let connectCalled = false
-    let pushCalled = false
-    let timerStarted = false
-
-    const mockRpc = {
-      isConnected: () => false,
-      connect: () => {
-        connectCalled = true
-        // Never resolves — models @xhayper/discord-rpc's ~10s IPC timeout
-        // when Discord desktop is not running.
-        return new Promise<boolean>(() => {})
-      },
-    }
-
-    const start = performance.now()
-    startPluginAsync(
-      mockRpc as unknown as DiscordRPCService,
-      async () => {
-        pushCalled = true
-      },
-      () => {
-        timerStarted = true
-      },
-    )
-    const elapsed = performance.now() - start
-
-    // Sync portion MUST complete fast even though connect() is pending forever
-    expect(elapsed).toBeLessThan(50)
-    expect(timerStarted).toBe(true)
-    expect(pushCalled).toBe(true)
-    expect(connectCalled).toBe(true)
-  })
-
-  test("skips connect when already connected", () => {
-    let connectCalled = false
-
-    const mockRpc = {
-      isConnected: () => true,
-      connect: () => {
-        connectCalled = true
-        return Promise.resolve(true)
-      },
-    }
-
-    startPluginAsync(
-      mockRpc as unknown as DiscordRPCService,
-      async () => {},
-      () => {},
-    )
-
-    expect(connectCalled).toBe(false)
-  })
-
-  test("does not propagate connect() rejections to the caller", () => {
-    const mockRpc = {
-      isConnected: () => false,
-      connect: () => Promise.reject(new Error("boom")),
-    }
-
-    expect(() =>
-      startPluginAsync(
-        mockRpc as unknown as DiscordRPCService,
-        async () => {},
-        () => {},
-      ),
-    ).not.toThrow()
-  })
-
-  test("F9: does NOT start rotation timer or connect when isOwner returns false", () => {
-    let timerStarted = false
-    let pushCalled = false
-    let connectCalled = false
-
-    const mockRpc = {
-      isConnected: () => false,
-      connect: () => {
-        connectCalled = true
-        return Promise.resolve(true)
-      },
-    }
-
-    startPluginAsync(
-      mockRpc as unknown as DiscordRPCService,
-      async () => {
-        pushCalled = true
-      },
-      () => {
-        timerStarted = true
-      },
-      () => false,
-    )
-
-    expect(timerStarted).toBe(false)
-    expect(pushCalled).toBe(false)
-    expect(connectCalled).toBe(false)
   })
 })
 

@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
-import type { DiscordRPCService as DiscordRPCServiceType } from "./discord-rpc"
 
 // ─── Mock Client ───────────────────────────────────────────────────────────────
 
@@ -61,8 +60,7 @@ mock.module("@xhayper/discord-rpc", () => ({
   Client: MockDiscordClient,
 }))
 
-const { createRecapCleanupTask, DiscordRPCService, MAX_RETRIES, shouldLogConnectFailure } =
-  await import("./discord-rpc")
+const { DiscordRPCService, MAX_RETRIES, shouldLogConnectFailure } = await import("./discord-rpc")
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
@@ -153,53 +151,6 @@ describe("DiscordRPCService", () => {
       await rpc.disconnect()
 
       expect(mockClient.destroyCalls).toBe(1)
-    })
-  })
-
-  describe("recap cleanup task", () => {
-    test("cleanup task clears presence before destroy", async () => {
-      const events: string[] = []
-      const mockClient = createMockClient(events)
-      const rpc = new DiscordRPCService("123")
-      // @ts-expect-error — test injection
-      rpc._overrideClient(mockClient)
-      rpc._setConnected(true)
-
-      let recapCleared = 0
-      const cleanup = createRecapCleanupTask(rpc, () => {
-        recapCleared++
-        events.push("recap")
-      })
-
-      await cleanup()
-
-      expect(recapCleared).toBe(1)
-      expect(events).toEqual(["recap", "clear", "destroy"])
-    })
-
-    test("cleanup task captures the original rpc instance and cannot clear a newer one", async () => {
-      const firstClient = createMockClient()
-      const secondClient = createMockClient()
-      const sessionA = new DiscordRPCService("123")
-      const sessionB = new DiscordRPCService("456")
-      // @ts-expect-error — test injection
-      sessionA._overrideClient(firstClient)
-      // @ts-expect-error — test injection
-      sessionB._overrideClient(secondClient)
-      sessionA._setConnected(true)
-      sessionB._setConnected(true)
-
-      const cleanup = createRecapCleanupTask(sessionA, () => {})
-      let activeRpc: DiscordRPCServiceType | null = sessionA
-      activeRpc = sessionB
-
-      await cleanup()
-
-      expect(activeRpc).toBe(sessionB)
-      expect(firstClient.user.clearActivityCalls).toBe(1)
-      expect(firstClient.destroyCalls).toBe(1)
-      expect(secondClient.user.clearActivityCalls).toBe(0)
-      expect(secondClient.destroyCalls).toBe(0)
     })
   })
 
