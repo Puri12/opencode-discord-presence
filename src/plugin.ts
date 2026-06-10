@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto"
-import { readFile } from "node:fs/promises"
 import { homedir, hostname } from "node:os"
-import { join } from "node:path"
 import type { Plugin } from "@opencode-ai/plugin"
 import { getConfig } from "./config.js"
+import { loadConfigFile } from "./config-loader.js"
+import { buildInstancesDir, createOwnershipHandler } from "./lifecycle/ownership-handler.js"
+import { createRecapScheduler, type RecapScheduler } from "./lifecycle/recap-scheduler.js"
+import { createRotationTicker } from "./lifecycle/rotation-ticker.js"
 import { DiscordRPCService } from "./services/discord-rpc.js"
 import { InstanceCoordinator } from "./services/instance-coordinator.js"
 import { PresenceOrchestrator } from "./services/presence-orchestrator.js"
@@ -18,7 +20,8 @@ import {
   updateRecapCache,
   updateTodoSummary,
 } from "./state/presence-state.js"
-import type { DiscordPresenceOptions, RichPresenceOptions } from "./types/index.js"
+import type { RichPresenceOptions } from "./types/index.js"
+import { extractFilePathFromArgs } from "./utils/arg-paths.js"
 import {
   createSessionMetricsState,
   createSessionRecap,
@@ -35,27 +38,6 @@ import {
   saveSessionMetrics,
 } from "./utils/session-persistence.js"
 import { getToolLabel } from "./utils/tool-label.js"
-
-async function loadConfigFile(directory: string): Promise<DiscordPresenceOptions | undefined> {
-  const paths = [
-    join(directory, ".discord-presence.json"),
-    join(homedir(), ".discord-presence.json"),
-  ]
-
-  for (const configPath of paths) {
-    try {
-      const content = await readFile(configPath, "utf-8")
-      return JSON.parse(content) as DiscordPresenceOptions
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue
-      // Malformed config silently falls back to defaults. Logging here would
-      // bypass the debug gate (debug itself is in the config we couldn't
-      // parse), violating the "silent by default" promise. Users can verify
-      // their config by passing the file through any JSON validator.
-    }
-  }
-  return undefined
-}
 
 interface ToolExecuteInput {
   tool: string
@@ -78,49 +60,6 @@ type CallIDContext = Map<
   }
 >
 
-// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: recursive traversal of unknown arg shape needed
-function extractFilePathFromArgs(args?: unknown): string | undefined {
-  if (!args) return undefined
-  if (typeof args === "string") {
-    const trimmed = args.trim()
-    const quotedWithSingle = trimmed.startsWith("'") && trimmed.endsWith("'")
-    const quotedWithDouble = trimmed.startsWith('"') && trimmed.endsWith('"')
-    const wasQuoted = quotedWithSingle || quotedWithDouble
-    const candidate = wasQuoted ? trimmed.slice(1, -1).trim() : trimmed
-
-    if (!candidate || candidate.startsWith("-")) {
-      return undefined
-    }
-
-    if (!(candidate.includes("/") || candidate.includes("\\"))) {
-      return undefined
-    }
-
-    if (!wasQuoted && /\s/.test(candidate)) {
-      return undefined
-    }
-
-    if (candidate.includes(" ")) {
-      return undefined
-    }
-
-    return normalizeFileIdentity(candidate)
-  }
-  if (Array.isArray(args)) {
-    for (const item of args) {
-      const extracted = extractFilePathFromArgs(item)
-      if (extracted) return extracted
-    }
-  }
-  if (typeof args === "object") {
-    for (const value of Object.values(args)) {
-      const extracted = extractFilePathFromArgs(value)
-      if (extracted) return extracted
-    }
-  }
-  return undefined
-}
-
 function countRotatingCards(
   opts: RichPresenceOptions,
   hasWarnings: boolean,
@@ -132,188 +71,6 @@ function countRotatingCards(
   if (hasWarnings && errors === 0) count++
   count++ // session-stats always present as ultimate fallback
   return Math.max(count, 1)
-}
-
-function sanitizeForFilename(raw: string, fallback: string): string {
-  const sanitized = raw.replace(/[^A-Za-z0-9_-]/g, "_")
-  return sanitized || fallback
-}
-
-/**
- * Builds the per-machine, per-Discord-app instance election directory.
- * Hostname segregation keeps shared-HOME setups (NFS, SMB, Dropbox) from
- * making one machine's CLIs suppress another's. ClientId segregation keeps
- * users running multiple Discord application IDs from cross-contaminating.
- */
-export function buildInstancesDir(home: string, host: string, clientId: string): string {
-  const safeHost = sanitizeForFilename(host, "unknown-host")
-  const safeClient = sanitizeForFilename(clientId, "default")
-  return join(home, ".opencode-discord-presence", "instances", safeHost, safeClient)
-}
-
-/**
- * Settle delay between gaining ownership and calling `rpc.connect()`. Must
- * exceed the coordinator's tick interval (default 1000ms in instance-coordinator)
- * so the previous owner has had at least one tick to discover its ownership
- * loss and run its `rpc.clear()` + `rpc.disconnect()` before the new owner
- * contends for Discord's IPC socket. Without this slack, a fast handoff
- * leaves a brief window where A.clear() can erase B's freshly-pushed presence.
- */
-const DEFAULT_OWNER_SETTLE_MS = 1200
-
-export interface OwnershipHandlerOptions {
-  rpc: Pick<DiscordRPCService, "connect" | "disconnect" | "clear">
-  pushPresence: () => Promise<void>
-  startRotationTimer: () => void
-  stopRotationTimer: () => void
-  isStillOwner: () => boolean
-  settleMs?: number
-  setTimeoutImpl?: typeof setTimeout
-  clearTimeoutImpl?: typeof clearTimeout
-}
-
-export interface OwnershipHandler {
-  onOwnership: (isOwner: boolean) => void
-  cancelPending: () => void
-}
-
-/**
- * Builds an ownership-change handler with a settle delay before connecting.
- * Gaining ownership schedules a connect after `settleMs`; losing it cancels
- * the pending connect and disconnects immediately. The settle window lets
- * the previous owner finish its disconnect before the new owner contends
- * for Discord's single IPC socket — without it, rapid ownership flips during
- * concurrent CLI startup cause connect/disconnect churn and IPC throttling.
- */
-export function createOwnershipHandler(opts: OwnershipHandlerOptions): OwnershipHandler {
-  const settleMs = opts.settleMs ?? DEFAULT_OWNER_SETTLE_MS
-  const setT = opts.setTimeoutImpl ?? setTimeout
-  const clearT = opts.clearTimeoutImpl ?? clearTimeout
-  let pending: ReturnType<typeof setTimeout> | null = null
-
-  const cancelPending = () => {
-    if (pending) {
-      clearT(pending)
-      pending = null
-    }
-  }
-
-  const onOwnership = (isOwner: boolean): void => {
-    cancelPending()
-    if (isOwner) {
-      pending = setT(() => {
-        pending = null
-        if (!opts.isStillOwner()) return
-        opts.startRotationTimer()
-        void opts.pushPresence()
-        opts.rpc.connect().catch(() => {})
-      }, settleMs)
-      pending?.unref?.()
-    } else {
-      opts.stopRotationTimer()
-      void opts.rpc.clear()
-      void opts.rpc.disconnect()
-    }
-  }
-
-  return { onOwnership, cancelPending }
-}
-
-const DEFAULT_RECAP_DELAY_MS = 30_000
-
-export interface RecapSchedulerOptions {
-  clearRecapState: () => void
-  delayMs?: number
-  setTimeoutImpl?: typeof setTimeout
-  clearTimeoutImpl?: typeof clearTimeout
-}
-
-export interface RecapScheduler {
-  schedule: () => void
-  flushNow: () => void
-  cancel: () => void
-}
-
-/**
- * Owns the lifecycle of the post-session recap card. The recap is purely a
- * visual state on the snapshot — the RPC lifecycle stays tied to ownership,
- * not the recap. After `delayMs`, the recap state is cleared so rotation no
- * longer surfaces the recap card. `flushNow()` clears immediately (used by
- * any user activity that should resume normal presence); `cancel()` drops
- * the pending clear without running it (used on dispose).
- */
-export function createRecapScheduler(opts: RecapSchedulerOptions): RecapScheduler {
-  const setT = opts.setTimeoutImpl ?? setTimeout
-  const clearT = opts.clearTimeoutImpl ?? clearTimeout
-  const delayMs = opts.delayMs ?? DEFAULT_RECAP_DELAY_MS
-
-  let timer: ReturnType<typeof setTimeout> | null = null
-  let pending = false
-
-  const runOnce = (): void => {
-    if (!pending) return
-    pending = false
-    opts.clearRecapState()
-  }
-
-  const schedule = (): void => {
-    if (timer) clearT(timer)
-    pending = true
-    timer = setT(() => {
-      timer = null
-      runOnce()
-    }, delayMs)
-    timer?.unref?.()
-  }
-
-  const flushNow = (): void => {
-    if (timer) {
-      clearT(timer)
-      timer = null
-    }
-    runOnce()
-  }
-
-  const cancel = (): void => {
-    if (timer) {
-      clearT(timer)
-      timer = null
-    }
-    pending = false
-  }
-
-  return { schedule, flushNow, cancel }
-}
-
-export interface RotationTickerOptions {
-  getRotationIndex: () => number
-  setRotationIndex: (index: number) => void
-  countCards: () => number
-  pushPresence: () => Promise<void>
-  onError: (error: unknown) => void
-}
-
-export interface RotationTicker {
-  tick: () => Promise<void>
-}
-
-export function createRotationTicker(opts: RotationTickerOptions): RotationTicker {
-  let inFlight = false
-
-  const tick = async (): Promise<void> => {
-    if (inFlight) return
-    inFlight = true
-    try {
-      opts.setRotationIndex((opts.getRotationIndex() + 1) % opts.countCards())
-      await opts.pushPresence()
-    } catch (error) {
-      opts.onError(error)
-    } finally {
-      inFlight = false
-    }
-  }
-
-  return { tick }
 }
 
 /**

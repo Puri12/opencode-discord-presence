@@ -2,11 +2,10 @@ import { describe, expect, test } from "bun:test"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { buildInstancesDir, createOwnershipHandler } from "./lifecycle/ownership-handler.js"
+import { createRecapScheduler } from "./lifecycle/recap-scheduler.js"
+import { createRotationTicker } from "./lifecycle/rotation-ticker.js"
 import {
-  buildInstancesDir,
-  createOwnershipHandler,
-  createRecapScheduler,
-  createRotationTicker,
   isPrimaryPluginInstance,
   OpenCodeDiscordPresence,
   releasePrimaryPluginInstance,
