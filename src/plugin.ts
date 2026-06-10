@@ -83,8 +83,11 @@ export function releasePrimaryPluginInstance(): void {
 }
 
 export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
-  const fileOptions = await loadConfigFile(ctx.directory)
+  const { options: fileOptions, parseError } = await loadConfigFile(ctx.directory)
   const config = getConfig(fileOptions)
+  if (parseError && config.debug) {
+    console.warn(`[discord-presence] failed to parse ${parseError.path}`, parseError.error)
+  }
   if (!config.enabled) return {}
 
   if (!isPrimaryPluginInstance()) return {}

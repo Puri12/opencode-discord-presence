@@ -658,6 +658,39 @@ describe("DiscordRPCService", () => {
     })
   })
 
+  describe("connect() preemption by disconnect()", () => {
+    test("in-flight connect() resolves false when disconnect() preempts it", async () => {
+      const rpc = new DiscordRPCService("123")
+
+      const pending = rpc.connect()
+      await rpc.disconnect()
+
+      const result = await Promise.race([
+        pending,
+        new Promise<string>((resolve) => setTimeout(() => resolve("hung"), 100)),
+      ])
+
+      expect(result).toBe(false)
+    })
+
+    test("stale ready after disconnect() resolves the original connect() false", async () => {
+      const rpc = new DiscordRPCService("123")
+
+      const pending = rpc.connect()
+      const staleReady = constructedClients[0]._handlers.ready
+      await rpc.disconnect()
+      staleReady()
+
+      const result = await Promise.race([
+        pending,
+        new Promise<string>((resolve) => setTimeout(() => resolve("hung"), 100)),
+      ])
+
+      expect(result).toBe(false)
+      expect(rpc.isConnected()).toBe(false)
+    })
+  })
+
   describe("recovery after MAX_RETRIES (self-heal on explicit connect)", () => {
     test("explicit connect() resets retryCount when previously exhausted", () => {
       const rpc = new DiscordRPCService("123")

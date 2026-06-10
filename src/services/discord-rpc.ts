@@ -59,6 +59,7 @@ export interface DiscordRPCOptions {
 export class DiscordRPCService {
   private client: Client | null = null
   private connectPromise: Promise<boolean> | null = null
+  private resolveInFlightConnect: ((connected: boolean) => void) | null = null
   private connected = false
   private retryCount = 0
   private sessionStart: Date = new Date()
@@ -172,11 +173,15 @@ export class DiscordRPCService {
     }
 
     const attempt = new Promise<boolean>((resolve) => {
+      this.resolveInFlightConnect = resolve
       try {
         this.client = new Client({ clientId: this.clientId })
 
         this.client.on("ready", () => {
-          if (myGeneration !== this.clientGeneration) return
+          if (myGeneration !== this.clientGeneration) {
+            resolve(false)
+            return
+          }
           this.connected = true
           this.retryCount = 0
           this.log("Connected to Discord")
@@ -217,6 +222,7 @@ export class DiscordRPCService {
     })
 
     const promise = attempt.finally(() => {
+      this.resolveInFlightConnect = null
       if (this.connectPromise === promise) {
         this.connectPromise = null
       }
@@ -243,6 +249,11 @@ export class DiscordRPCService {
     this.disconnecting = true
     this.connected = false
     this.connectPromise = null
+    // Settle any caller awaiting an in-flight connect(); the generation bump
+    // below makes that attempt permanently stale, so without this it would
+    // hang forever (its ready/login callbacks bail on the generation check).
+    this.resolveInFlightConnect?.(false)
+    this.resolveInFlightConnect = null
     this.retryCount = 0
     this.cleared = true
     this.clientGeneration++
