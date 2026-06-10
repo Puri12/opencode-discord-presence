@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { buildInstancesDir, createOwnershipHandler } from "./lifecycle/ownership-handler.js"
+import { createRecapScheduler } from "./lifecycle/recap-scheduler.js"
+import { createRotationTicker } from "./lifecycle/rotation-ticker.js"
 import {
-  buildInstancesDir,
-  createOwnershipHandler,
-  createRecapScheduler,
   isPrimaryPluginInstance,
+  OpenCodeDiscordPresence,
   releasePrimaryPluginInstance,
-  startPluginAsync,
 } from "./plugin.js"
 import type { DiscordRPCService } from "./services/discord-rpc.js"
 import {
@@ -28,6 +31,40 @@ import {
   recordTaskContext,
 } from "./utils/session-metrics.js"
 import { getToolLabel } from "./utils/tool-label.js"
+
+function makePluginContext(directory: string, log?: () => void) {
+  return {
+    directory,
+    client: {
+      app: {
+        log: log ?? (() => {}),
+      },
+      session: {
+        get: async () => ({ data: { parentID: null } }),
+      },
+    },
+  }
+}
+
+type TestPluginHooks = Awaited<ReturnType<typeof OpenCodeDiscordPresence>> & {
+  dispose?: () => void | Promise<void>
+}
+
+async function createTestPlugin(directory: string, log?: () => void): Promise<TestPluginHooks> {
+  return (await OpenCodeDiscordPresence(
+    makePluginContext(directory, log) as unknown as Parameters<typeof OpenCodeDiscordPresence>[0],
+  )) as TestPluginHooks
+}
+
+async function withTempPluginDirectory<T>(fn: (directory: string) => Promise<T>): Promise<T> {
+  const directory = await mkdtemp(join(tmpdir(), "opencode-discord-presence-test-"))
+  try {
+    return await fn(directory)
+  } finally {
+    releasePrimaryPluginInstance()
+    await rm(directory, { recursive: true, force: true })
+  }
+}
 
 // ─── normalizeFileIdentity ────────────────────────────────────────────────────
 
@@ -771,108 +808,6 @@ describe("primary plugin instance dedup", () => {
   })
 })
 
-// ─── startPluginAsync (non-blocking init) ─────────────────────────────────────
-
-describe("startPluginAsync — non-blocking init", () => {
-  test("returns synchronously without awaiting connect even when Discord is unreachable", () => {
-    let connectCalled = false
-    let pushCalled = false
-    let timerStarted = false
-
-    const mockRpc = {
-      isConnected: () => false,
-      connect: () => {
-        connectCalled = true
-        // Never resolves — models @xhayper/discord-rpc's ~10s IPC timeout
-        // when Discord desktop is not running.
-        return new Promise<boolean>(() => {})
-      },
-    }
-
-    const start = performance.now()
-    startPluginAsync(
-      mockRpc as unknown as DiscordRPCService,
-      async () => {
-        pushCalled = true
-      },
-      () => {
-        timerStarted = true
-      },
-    )
-    const elapsed = performance.now() - start
-
-    // Sync portion MUST complete fast even though connect() is pending forever
-    expect(elapsed).toBeLessThan(50)
-    expect(timerStarted).toBe(true)
-    expect(pushCalled).toBe(true)
-    expect(connectCalled).toBe(true)
-  })
-
-  test("skips connect when already connected", () => {
-    let connectCalled = false
-
-    const mockRpc = {
-      isConnected: () => true,
-      connect: () => {
-        connectCalled = true
-        return Promise.resolve(true)
-      },
-    }
-
-    startPluginAsync(
-      mockRpc as unknown as DiscordRPCService,
-      async () => {},
-      () => {},
-    )
-
-    expect(connectCalled).toBe(false)
-  })
-
-  test("does not propagate connect() rejections to the caller", () => {
-    const mockRpc = {
-      isConnected: () => false,
-      connect: () => Promise.reject(new Error("boom")),
-    }
-
-    expect(() =>
-      startPluginAsync(
-        mockRpc as unknown as DiscordRPCService,
-        async () => {},
-        () => {},
-      ),
-    ).not.toThrow()
-  })
-
-  test("F9: does NOT start rotation timer or connect when isOwner returns false", () => {
-    let timerStarted = false
-    let pushCalled = false
-    let connectCalled = false
-
-    const mockRpc = {
-      isConnected: () => false,
-      connect: () => {
-        connectCalled = true
-        return Promise.resolve(true)
-      },
-    }
-
-    startPluginAsync(
-      mockRpc as unknown as DiscordRPCService,
-      async () => {
-        pushCalled = true
-      },
-      () => {
-        timerStarted = true
-      },
-      () => false,
-    )
-
-    expect(timerStarted).toBe(false)
-    expect(pushCalled).toBe(false)
-    expect(connectCalled).toBe(false)
-  })
-})
-
 describe("buildInstancesDir", () => {
   test("path includes hostname and clientId subdirectories", () => {
     const result = buildInstancesDir("/home/u", "host-1", "12345")
@@ -899,6 +834,47 @@ describe("buildInstancesDir", () => {
     const a = buildInstancesDir("/home/u", "host-a", "app")
     const b = buildInstancesDir("/home/u", "host-b", "app")
     expect(a).not.toBe(b)
+  })
+})
+
+describe("OpenCodeDiscordPresence hook robustness", () => {
+  test("guarded event hook resolves when ctx.client.app.log throws", async () => {
+    await withTempPluginDirectory(async (directory) => {
+      const plugin = await createTestPlugin(directory, () => {
+        throw new Error("log failed")
+      })
+
+      await plugin.event?.({
+        event: { type: "unknown.test", properties: {} } as unknown as Parameters<
+          NonNullable<typeof plugin.event>
+        >[0]["event"],
+      })
+
+      await plugin.dispose?.()
+    })
+  })
+})
+
+describe("OpenCodeDiscordPresence shutdown lifecycle", () => {
+  test("dispose removes signal listeners and double dispose is a no-op", async () => {
+    await withTempPluginDirectory(async (directory) => {
+      const sigintBefore = process.listenerCount("SIGINT")
+      const sigtermBefore = process.listenerCount("SIGTERM")
+
+      const plugin = await createTestPlugin(directory)
+
+      expect(process.listenerCount("SIGINT")).toBe(sigintBefore + 1)
+      expect(process.listenerCount("SIGTERM")).toBe(sigtermBefore + 1)
+
+      await plugin.dispose?.()
+
+      expect(process.listenerCount("SIGINT")).toBe(sigintBefore)
+      expect(process.listenerCount("SIGTERM")).toBe(sigtermBefore)
+
+      await plugin.dispose?.()
+      expect(process.listenerCount("SIGINT")).toBe(sigintBefore)
+      expect(process.listenerCount("SIGTERM")).toBe(sigtermBefore)
+    })
   })
 })
 
@@ -1202,5 +1178,79 @@ describe("createRecapScheduler", () => {
     expect(cleared()).toBe(1)
     scheduler.flushNow()
     expect(cleared()).toBe(1)
+  })
+})
+
+describe("createRotationTicker", () => {
+  test("rotation timer skips ticks while a push is in flight", async () => {
+    let rotationIndex = 0
+    let entered = 0
+    let releasePush: (() => void) | undefined
+
+    const ticker = createRotationTicker({
+      getRotationIndex: () => rotationIndex,
+      setRotationIndex: (next) => {
+        rotationIndex = next
+      },
+      countCards: () => 3,
+      pushPresence: async () => {
+        entered++
+        await new Promise<void>((resolve) => {
+          releasePush = resolve
+        })
+      },
+      onError: () => {},
+    })
+
+    const firstTick = ticker.tick()
+    const skippedSecondTick = ticker.tick()
+    const skippedThirdTick = ticker.tick()
+
+    await Promise.resolve()
+
+    expect(entered).toBe(1)
+    expect(rotationIndex).toBe(1)
+
+    releasePush?.()
+    await firstTick
+    await skippedSecondTick
+    await skippedThirdTick
+
+    const nextTick = ticker.tick()
+    await Promise.resolve()
+
+    expect(entered).toBe(2)
+    expect(rotationIndex).toBe(2)
+
+    releasePush?.()
+    await nextTick
+  })
+
+  test("rotation timer catches push rejections and allows later ticks", async () => {
+    let entered = 0
+    let errors = 0
+    let rotationIndex = 0
+
+    const ticker = createRotationTicker({
+      getRotationIndex: () => rotationIndex,
+      setRotationIndex: (next) => {
+        rotationIndex = next
+      },
+      countCards: () => 3,
+      pushPresence: async () => {
+        entered++
+        if (entered === 1) throw new Error("push failed")
+      },
+      onError: () => {
+        errors++
+      },
+    })
+
+    await ticker.tick()
+    await ticker.tick()
+
+    expect(entered).toBe(2)
+    expect(errors).toBe(1)
+    expect(rotationIndex).toBe(2)
   })
 })

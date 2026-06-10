@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { InstanceCoordinator, type InstanceRecord } from "./instance-coordinator"
@@ -279,6 +279,37 @@ describe("InstanceCoordinator", () => {
   })
 
   describe("F4: write-failure forces non-owner (fail-closed)", () => {
+    test("constructor with unwritable instancesDir starts as non-owner", () => {
+      const blocker = join(dir, "not-a-directory")
+      const instancesDir = join(blocker, "instances")
+      writeFileSync(blocker, "blocks recursive mkdir")
+
+      const coord = new InstanceCoordinator({ instancesDir, pid: 1000 })
+      const events: boolean[] = []
+      coord.onOwnershipChange((isOwner) => events.push(isOwner))
+
+      expect(coord.isOwner()).toBe(false)
+      expect(events).not.toContain(true)
+    })
+
+    test("recovers ownership later when writes start succeeding", () => {
+      const blocker = join(dir, "not-a-directory")
+      const instancesDir = join(blocker, "instances")
+      writeFileSync(blocker, "blocks recursive mkdir")
+
+      const coord = new InstanceCoordinator({ instancesDir, pid: 1000 })
+      const events: boolean[] = []
+      coord.onOwnershipChange((isOwner) => events.push(isOwner))
+      expect(coord.isOwner()).toBe(false)
+
+      rmSync(blocker, { force: true })
+      mkdirSync(instancesDir, { recursive: true })
+      coord.tick()
+
+      expect(coord.isOwner()).toBe(true)
+      expect(events).toEqual([true])
+    })
+
     test("when writeOwnFile fails, instance demotes itself and notifies listeners", () => {
       const readOnlyDir = mkdtempSync(join(tmpdir(), "instance-coord-ro-"))
       try {

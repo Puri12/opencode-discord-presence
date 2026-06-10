@@ -232,6 +232,15 @@ Include:
 - Demonstrates proper i18n patterns
 - Can be extended for other languages
 
+## Error-Handling Conventions
+
+Failure semantics are layered — follow these when adding code:
+
+1. **Hook boundary (`src/plugin.ts`)**: hooks never throw into the OpenCode host. Every returned hook is wrapped in `guard()`, which catches, logs only when `debug: true`, and resolves. Timer callbacks follow the same rule.
+2. **Services (`DiscordRPCService`, `InstanceCoordinator`)**: expected failures (connection refused, fs write failure) return `false` or no-op; they never throw to callers. Unexpected internal errors are caught and surfaced via debug-gated logs.
+3. **Utils (`session-persistence`, etc.)**: best-effort and silent. fs errors are swallowed; loads return `null`/`undefined` on missing or corrupt data.
+4. **"Silent by default"**: nothing prints to the console unless `debug: true`. Never add an unconditional `console.*` call.
+
 ## Getting Help
 
 - Check existing issues and discussions

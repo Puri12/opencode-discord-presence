@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { mkdirSync, rmSync, writeFileSync } from "node:fs"
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -83,6 +91,50 @@ describe("session-persistence", () => {
 
     const result = await loadSessionMetrics(testDir)
     expect(result).toBeNull()
+  })
+
+  test("saveSessionMetrics writes atomically via tmp+rename", async () => {
+    const { saveSessionMetrics } = await import("./session-persistence")
+    const metrics: SessionMetricsState = {
+      messageCount: 42,
+      uniqueFilesTouched: new Set(["atomic.ts"]),
+      sessionStartTimestamp: Date.now(),
+      activeDurationSeconds: 12,
+      lastActivityTimestamp: Date.now(),
+      agentSwitches: 1,
+    }
+
+    await saveSessionMetrics(metrics, testDir, { instanceId: "atomic" })
+
+    const tmpFiles = readdirSync(testDir).filter((name) => name.endsWith(".tmp"))
+    expect(tmpFiles).toEqual([])
+
+    const targetPath = join(testDir, "session-metrics-atomic.json")
+    const parsed = JSON.parse(readFileSync(targetPath, "utf8"))
+    expect(parsed.messageCount).toBe(42)
+    expect(parsed.uniqueFilesTouched).toEqual(["atomic.ts"])
+  })
+
+  test("save into an unwritable directory does not throw", async () => {
+    const { saveSessionMetrics } = await import("./session-persistence")
+    const fileInsteadOfDir = join(testDir, "not-a-dir")
+    writeFileSync(fileInsteadOfDir, "not a directory", "utf8")
+    const metrics: SessionMetricsState = {
+      messageCount: 1,
+      uniqueFilesTouched: new Set(),
+      sessionStartTimestamp: Date.now(),
+      activeDurationSeconds: 0,
+      lastActivityTimestamp: Date.now(),
+      agentSwitches: 0,
+    }
+
+    let thrown: unknown
+    try {
+      await saveSessionMetrics(metrics, fileInsteadOfDir)
+    } catch (error) {
+      thrown = error
+    }
+    expect(thrown).toBeUndefined()
   })
 
   test("session metrics are cleared after clearSessionMetrics is called", async () => {
@@ -223,24 +275,26 @@ describe("session-persistence", () => {
     expect(removed).not.toContain("session-metrics-mine.json")
   })
 
-  test("pruneStaleSessionMetrics ignores legacy session-metrics.json (no -<id> suffix)", async () => {
+  test("pruneStaleSessionMetrics removes stale legacy session-metrics.json", async () => {
     const { pruneStaleSessionMetrics } = await import("./session-persistence")
     const legacyPath = join(testDir, "session-metrics.json")
-    writeFileSync(
-      legacyPath,
-      JSON.stringify({
-        messageCount: 0,
-        uniqueFilesTouched: [],
-        sessionStartTimestamp: Date.now() - 60 * 60 * 1000,
-        activeDurationSeconds: 0,
-        lastActivityTimestamp: Date.now() - 60 * 60 * 1000,
-        agentSwitches: 0,
-        savedAt: Date.now() - 60 * 60 * 1000,
-      }),
-    )
+    writeFileSync(legacyPath, JSON.stringify({ messageCount: 0, uniqueFilesTouched: [] }))
+    const oldTime = new Date(Date.now() - 60 * 60 * 1000)
+    utimesSync(legacyPath, oldTime, oldTime)
+
+    const removed = await pruneStaleSessionMetrics(testDir)
+    expect(removed).toContain("session-metrics.json")
+    expect(existsSync(legacyPath)).toBe(false)
+  })
+
+  test("pruneStaleSessionMetrics keeps fresh legacy session-metrics.json", async () => {
+    const { pruneStaleSessionMetrics } = await import("./session-persistence")
+    const legacyPath = join(testDir, "session-metrics.json")
+    writeFileSync(legacyPath, JSON.stringify({ messageCount: 0, uniqueFilesTouched: [] }))
 
     const removed = await pruneStaleSessionMetrics(testDir)
     expect(removed).not.toContain("session-metrics.json")
+    expect(existsSync(legacyPath)).toBe(true)
   })
 
   test("pruneStaleSessionMetrics is safe when dir does not exist", async () => {

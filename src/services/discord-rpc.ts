@@ -4,8 +4,11 @@ import type { Language, RichPresenceOptions, SetActivity } from "../types/index.
 import { getActivity } from "../utils/activity-rotation.js"
 
 const RECONNECT_DELAY = 5000
+const MAX_RECONNECT_DELAY = 60000
+const RECONNECT_JITTER_RATIO = 0.2
 const MAX_RETRIES = 10
 const DEBOUNCE_MS = 100
+export const MIN_UPDATE_GAP_MS = 2000
 const MAX_DETAILS_LENGTH = 126
 const MAX_STATE_LENGTH = 126
 
@@ -15,18 +18,6 @@ const PRESENCE_BUTTONS: NonNullable<SetActivity["buttons"]> = [
     url: "https://github.com/Puri12/opencode-discord-presence",
   },
 ]
-
-export function createRecapCleanupTask(
-  rpc: DiscordRPCService | null,
-  clearRecapState: () => void,
-): () => Promise<void> {
-  return async () => {
-    clearRecapState()
-    if (!rpc) return
-    await rpc.clear()
-    await rpc.disconnect()
-  }
-}
 
 function truncate(str: string, maxLen: number): string {
   if (str.length <= maxLen) return str
@@ -67,6 +58,8 @@ export interface DiscordRPCOptions {
  */
 export class DiscordRPCService {
   private client: Client | null = null
+  private connectPromise: Promise<boolean> | null = null
+  private resolveInFlightConnect: ((connected: boolean) => void) | null = null
   private connected = false
   private retryCount = 0
   private sessionStart: Date = new Date()
@@ -88,6 +81,7 @@ export class DiscordRPCService {
   // ── Debounce state ──────────────────────────────────────────────────────
   private pendingUpdate: SetActivity | null = null
   private debounceTimer: ReturnType<typeof setTimeout> | null = null
+  private lastFlushAt = 0
 
   // ── Reconnect timer ─────────────────────────────────────────────────────
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -95,6 +89,7 @@ export class DiscordRPCService {
   // ── Timer injection (for testing) ───────────────────────────────────────
   private _setTimeoutImpl: typeof setTimeout = setTimeout
   private _clearTimeoutImpl: typeof clearTimeout = clearTimeout
+  private _randomImpl: () => number = Math.random
 
   constructor(
     private clientId: string,
@@ -122,6 +117,10 @@ export class DiscordRPCService {
     this._clearTimeoutImpl = clearTimeoutImpl
   }
 
+  _setRandomImpl(randomImpl: () => number) {
+    this._randomImpl = randomImpl
+  }
+
   _getState() {
     return {
       connected: this.connected,
@@ -131,6 +130,7 @@ export class DiscordRPCService {
       hasPendingUpdate: this.pendingUpdate !== null,
       hasDebounceTimer: this.debounceTimer !== null,
       hasCurrentPresence: this.currentPresence !== null,
+      lastFlushAt: this.lastFlushAt,
     }
   }
 
@@ -140,8 +140,9 @@ export class DiscordRPCService {
 
   // ─── Connection ───────────────────────────────────────────────────────
 
-  async connect(): Promise<boolean> {
-    if (this.connected) return true
+  connect(): Promise<boolean> {
+    if (this.connected) return Promise.resolve(true)
+    if (this.connectPromise) return this.connectPromise
 
     // connect() is an explicit "I want to be connected" signal. Reset the
     // disconnect-state flags so that (a) scheduleReconnect() can fire after a
@@ -163,12 +164,24 @@ export class DiscordRPCService {
 
     const myGeneration = ++this.clientGeneration
 
-    return new Promise((resolve) => {
+    const staleClient = this.client
+    this.client = null
+    if (staleClient?.destroy) {
+      staleClient.destroy().catch((error) => {
+        this.warn("Failed to destroy stale RPC client:", error)
+      })
+    }
+
+    const attempt = new Promise<boolean>((resolve) => {
+      this.resolveInFlightConnect = resolve
       try {
         this.client = new Client({ clientId: this.clientId })
 
         this.client.on("ready", () => {
-          if (myGeneration !== this.clientGeneration) return
+          if (myGeneration !== this.clientGeneration) {
+            resolve(false)
+            return
+          }
           this.connected = true
           this.retryCount = 0
           this.log("Connected to Discord")
@@ -207,6 +220,16 @@ export class DiscordRPCService {
         resolve(false)
       }
     })
+
+    const promise = attempt.finally(() => {
+      this.resolveInFlightConnect = null
+      if (this.connectPromise === promise) {
+        this.connectPromise = null
+      }
+    })
+
+    this.connectPromise = promise
+    return promise
   }
 
   /**
@@ -225,6 +248,12 @@ export class DiscordRPCService {
 
     this.disconnecting = true
     this.connected = false
+    this.connectPromise = null
+    // Settle any caller awaiting an in-flight connect(); the generation bump
+    // below makes that attempt permanently stale, so without this it would
+    // hang forever (its ready/login callbacks bail on the generation check).
+    this.resolveInFlightConnect?.(false)
+    this.resolveInFlightConnect = null
     this.retryCount = 0
     this.cleared = true
     this.clientGeneration++
@@ -277,8 +306,15 @@ export class DiscordRPCService {
     this.reconnectTimer = this._setTimeoutImpl(() => {
       this.reconnectTimer = null
       this.connect()
-    }, RECONNECT_DELAY)
+    }, this.getReconnectDelay())
     this.reconnectTimer.unref?.()
+  }
+
+  private getReconnectDelay(): number {
+    const exponent = Math.max(0, this.retryCount - 1)
+    const baseDelay = Math.min(RECONNECT_DELAY * 2 ** exponent, MAX_RECONNECT_DELAY)
+    const jitter = 1 + (this._randomImpl() * 2 - 1) * RECONNECT_JITTER_RATIO
+    return Math.round(baseDelay * jitter)
   }
 
   // ─── Presence updates (debounced) ─────────────────────────────────────
@@ -314,10 +350,15 @@ export class DiscordRPCService {
     this.pendingUpdate = activity
     if (this.debounceTimer) return
 
+    const now = Date.now()
+    const elapsedSinceFlush = now - this.lastFlushAt
+    const delay =
+      elapsedSinceFlush >= MIN_UPDATE_GAP_MS ? DEBOUNCE_MS : MIN_UPDATE_GAP_MS - elapsedSinceFlush
+
     this.debounceTimer = this._setTimeoutImpl(() => {
       this.debounceTimer = null
       this.flushPendingUpdate()
-    }, DEBOUNCE_MS)
+    }, delay)
     this.debounceTimer.unref?.()
   }
 
@@ -327,6 +368,7 @@ export class DiscordRPCService {
 
     const activity = this.pendingUpdate
     this.pendingUpdate = null
+    this.lastFlushAt = Date.now()
 
     try {
       this.client.user.setActivity(activity).catch((err) => {
