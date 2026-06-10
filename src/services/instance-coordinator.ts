@@ -72,13 +72,16 @@ export class InstanceCoordinator {
     this.allowedSkewMs = opts.allowedClockSkewMs ?? DEFAULT_CLOCK_SKEW_MS
     this.staleGraceTicks = opts.staleGracePeriodTicks ?? DEFAULT_STALE_GRACE_TICKS
 
+    let createdInstancesDir = true
     try {
       mkdirSync(opts.instancesDir, { recursive: true })
     } catch {
-      // proceed; writeOwnFile will fail and demote us via fail-closed path
+      createdInstancesDir = false
     }
     this.myFile = join(opts.instancesDir, `${this.pid}.json`)
-    this.writeOwnFile()
+    if (!createdInstancesDir || !this.writeOwnFile()) {
+      this.isOwnerFlag = false
+    }
   }
 
   start(): void {

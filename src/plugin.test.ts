@@ -1,9 +1,13 @@
 import { describe, expect, test } from "bun:test"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import {
   buildInstancesDir,
   createOwnershipHandler,
   createRecapScheduler,
   isPrimaryPluginInstance,
+  OpenCodeDiscordPresence,
   releasePrimaryPluginInstance,
   startPluginAsync,
 } from "./plugin.js"
@@ -28,6 +32,40 @@ import {
   recordTaskContext,
 } from "./utils/session-metrics.js"
 import { getToolLabel } from "./utils/tool-label.js"
+
+function makePluginContext(directory: string, log?: () => void) {
+  return {
+    directory,
+    client: {
+      app: {
+        log: log ?? (() => {}),
+      },
+      session: {
+        get: async () => ({ data: { parentID: null } }),
+      },
+    },
+  }
+}
+
+type TestPluginHooks = Awaited<ReturnType<typeof OpenCodeDiscordPresence>> & {
+  dispose?: () => void | Promise<void>
+}
+
+async function createTestPlugin(directory: string, log?: () => void): Promise<TestPluginHooks> {
+  return (await OpenCodeDiscordPresence(
+    makePluginContext(directory, log) as unknown as Parameters<typeof OpenCodeDiscordPresence>[0],
+  )) as TestPluginHooks
+}
+
+async function withTempPluginDirectory<T>(fn: (directory: string) => Promise<T>): Promise<T> {
+  const directory = await mkdtemp(join(tmpdir(), "opencode-discord-presence-test-"))
+  try {
+    return await fn(directory)
+  } finally {
+    releasePrimaryPluginInstance()
+    await rm(directory, { recursive: true, force: true })
+  }
+}
 
 // ─── normalizeFileIdentity ────────────────────────────────────────────────────
 
@@ -899,6 +937,47 @@ describe("buildInstancesDir", () => {
     const a = buildInstancesDir("/home/u", "host-a", "app")
     const b = buildInstancesDir("/home/u", "host-b", "app")
     expect(a).not.toBe(b)
+  })
+})
+
+describe("OpenCodeDiscordPresence hook robustness", () => {
+  test("guarded event hook resolves when ctx.client.app.log throws", async () => {
+    await withTempPluginDirectory(async (directory) => {
+      const plugin = await createTestPlugin(directory, () => {
+        throw new Error("log failed")
+      })
+
+      await plugin.event?.({
+        event: { type: "unknown.test", properties: {} } as unknown as Parameters<
+          NonNullable<typeof plugin.event>
+        >[0]["event"],
+      })
+
+      await plugin.dispose?.()
+    })
+  })
+})
+
+describe("OpenCodeDiscordPresence shutdown lifecycle", () => {
+  test("dispose removes signal listeners and double dispose is a no-op", async () => {
+    await withTempPluginDirectory(async (directory) => {
+      const sigintBefore = process.listenerCount("SIGINT")
+      const sigtermBefore = process.listenerCount("SIGTERM")
+
+      const plugin = await createTestPlugin(directory)
+
+      expect(process.listenerCount("SIGINT")).toBe(sigintBefore + 1)
+      expect(process.listenerCount("SIGTERM")).toBe(sigtermBefore + 1)
+
+      await plugin.dispose?.()
+
+      expect(process.listenerCount("SIGINT")).toBe(sigintBefore)
+      expect(process.listenerCount("SIGTERM")).toBe(sigtermBefore)
+
+      await plugin.dispose?.()
+      expect(process.listenerCount("SIGINT")).toBe(sigintBefore)
+      expect(process.listenerCount("SIGTERM")).toBe(sigtermBefore)
+    })
   })
 })
 

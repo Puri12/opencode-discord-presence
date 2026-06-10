@@ -1,10 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
-import {
-  createRecapCleanupTask,
-  DiscordRPCService,
-  MAX_RETRIES,
-  shouldLogConnectFailure,
-} from "./discord-rpc"
+import type { DiscordRPCService as DiscordRPCServiceType } from "./discord-rpc"
 
 // ─── Mock Client ───────────────────────────────────────────────────────────────
 
@@ -55,9 +50,28 @@ function createMockClient(events: string[] = []): MockClient {
   return client
 }
 
+const constructedClients: MockClient[] = []
+const MockDiscordClient = mock((_options: { clientId: string }) => {
+  const client = createMockClient()
+  constructedClients.push(client)
+  return client
+})
+
+mock.module("@xhayper/discord-rpc", () => ({
+  Client: MockDiscordClient,
+}))
+
+const { createRecapCleanupTask, DiscordRPCService, MAX_RETRIES, shouldLogConnectFailure } =
+  await import("./discord-rpc")
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 describe("DiscordRPCService", () => {
+  beforeEach(() => {
+    constructedClients.length = 0
+    MockDiscordClient.mockClear()
+  })
+
   describe("MAX_RETRIES constant", () => {
     test("MAX_RETRIES is exported and equals 10", () => {
       expect(MAX_RETRIES).toBe(10)
@@ -176,7 +190,7 @@ describe("DiscordRPCService", () => {
       sessionB._setConnected(true)
 
       const cleanup = createRecapCleanupTask(sessionA, () => {})
-      let activeRpc: DiscordRPCService | null = sessionA
+      let activeRpc: DiscordRPCServiceType | null = sessionA
       activeRpc = sessionB
 
       await cleanup()
@@ -516,6 +530,42 @@ describe("DiscordRPCService", () => {
       const result = await rpc.connect()
       expect(result).toBe(true)
       expect(rpc._getClientGeneration()).toBe(before)
+    })
+  })
+
+  describe("connect() singleflight", () => {
+    test("concurrent connect() returns same promise and constructs exactly one Client", async () => {
+      const rpc = new DiscordRPCService("123")
+
+      const first = rpc.connect()
+      const second = rpc.connect()
+
+      expect(second).toBe(first)
+      expect(MockDiscordClient.mock.calls.length).toBe(1)
+
+      constructedClients[0]._handlers.ready()
+      expect(await first).toBe(true)
+    })
+
+    test("stale previous client is destroyed before new connect creates another", async () => {
+      const staleClient = createMockClient()
+      const events: string[] = []
+      staleClient.destroy = async () => {
+        events.push("destroy")
+        staleClient.destroyCalls++
+      }
+      const rpc = new DiscordRPCService("123")
+      // @ts-expect-error — test injection
+      rpc._overrideClient(staleClient)
+
+      const connectPromise = rpc.connect()
+      events.push("created")
+      constructedClients[0]._handlers.ready()
+      await connectPromise
+
+      expect(staleClient.destroyCalls).toBe(1)
+      expect(events).toEqual(["destroy", "created"])
+      expect(MockDiscordClient.mock.calls.length).toBe(1)
     })
   })
 

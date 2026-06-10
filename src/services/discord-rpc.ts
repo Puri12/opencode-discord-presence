@@ -67,6 +67,7 @@ export interface DiscordRPCOptions {
  */
 export class DiscordRPCService {
   private client: Client | null = null
+  private connectPromise: Promise<boolean> | null = null
   private connected = false
   private retryCount = 0
   private sessionStart: Date = new Date()
@@ -140,8 +141,9 @@ export class DiscordRPCService {
 
   // ─── Connection ───────────────────────────────────────────────────────
 
-  async connect(): Promise<boolean> {
-    if (this.connected) return true
+  connect(): Promise<boolean> {
+    if (this.connected) return Promise.resolve(true)
+    if (this.connectPromise) return this.connectPromise
 
     // connect() is an explicit "I want to be connected" signal. Reset the
     // disconnect-state flags so that (a) scheduleReconnect() can fire after a
@@ -163,7 +165,15 @@ export class DiscordRPCService {
 
     const myGeneration = ++this.clientGeneration
 
-    return new Promise((resolve) => {
+    const staleClient = this.client
+    this.client = null
+    if (staleClient?.destroy) {
+      staleClient.destroy().catch((error) => {
+        this.warn("Failed to destroy stale RPC client:", error)
+      })
+    }
+
+    const attempt = new Promise<boolean>((resolve) => {
       try {
         this.client = new Client({ clientId: this.clientId })
 
@@ -207,6 +217,15 @@ export class DiscordRPCService {
         resolve(false)
       }
     })
+
+    const promise = attempt.finally(() => {
+      if (this.connectPromise === promise) {
+        this.connectPromise = null
+      }
+    })
+
+    this.connectPromise = promise
+    return promise
   }
 
   /**
@@ -225,6 +244,7 @@ export class DiscordRPCService {
 
     this.disconnecting = true
     this.connected = false
+    this.connectPromise = null
     this.retryCount = 0
     this.cleared = true
     this.clientGeneration++

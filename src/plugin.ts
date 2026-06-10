@@ -354,6 +354,25 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
   let rotationIndex = 0
   let rotationTimer: ReturnType<typeof setInterval> | null = null
   let activeRecapScheduler: RecapScheduler | null = null
+  let shutdownStarted = false
+
+  const warnDebug = (scope: string, error: unknown): void => {
+    if (!config.debug) return
+    console.warn(`[discord-presence] ${scope} failed`, error)
+  }
+
+  const guard = <Args extends unknown[]>(
+    scope: string,
+    fn: (...args: Args) => Promise<void>,
+  ): ((...args: Args) => Promise<void>) => {
+    return async (...args: Args): Promise<void> => {
+      try {
+        await fn(...args)
+      } catch (error) {
+        warnDebug(scope, error)
+      }
+    }
+  }
 
   const exitRecapIfNeeded = (): void => {
     if (!activeRecapScheduler) return
@@ -413,16 +432,19 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
   const startRotationTimer = () => {
     if (rotationTimer) clearInterval(rotationTimer)
     const intervalMs = config.richPresence.rotationIntervalSeconds * 1000
-    rotationTimer = setInterval(async () => {
-      rotationIndex =
-        (rotationIndex + 1) %
-        countRotatingCards(
-          config.richPresence,
-          snapshot.diagnosticsSummary.warnings > 0,
-          snapshot.diagnosticsSummary.errors,
-        )
-      await pushPresence()
-    }, intervalMs)
+    rotationTimer = setInterval(
+      guard("rotation timer", async () => {
+        rotationIndex =
+          (rotationIndex + 1) %
+          countRotatingCards(
+            config.richPresence,
+            snapshot.diagnosticsSummary.warnings > 0,
+            snapshot.diagnosticsSummary.errors,
+          )
+        await pushPresence()
+      }),
+      intervalMs,
+    )
     rotationTimer?.unref?.()
   }
 
@@ -471,6 +493,10 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
    * coordinator file on disk and the Discord activity stale.
    */
   const shutdown = async () => {
+    if (shutdownStarted) return
+    shutdownStarted = true
+    process.off("SIGINT", handleSigint)
+    process.off("SIGTERM", handleSigterm)
     releasePrimaryPluginInstance()
     ownershipHandler.cancelPending()
     cancelPendingRecap()
@@ -483,16 +509,19 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
     await current.disconnect()
   }
 
-  process.on("SIGINT", () => {
-    void shutdown()
-  })
-  process.on("SIGTERM", () => {
-    void shutdown()
-  })
+  const handleSigint = () => {
+    void shutdown().catch((error) => warnDebug("shutdown", error))
+  }
+  const handleSigterm = () => {
+    void shutdown().catch((error) => warnDebug("shutdown", error))
+  }
+
+  process.on("SIGINT", handleSigint)
+  process.on("SIGTERM", handleSigterm)
 
   return {
     dispose: () => shutdown(),
-    "chat.message": async (input, _output) => {
+    "chat.message": guard("chat.message", async (input, _output) => {
       const sessionID = (input as { sessionID?: string }).sessionID ?? ""
       if (await shouldSkipSession(sessionID)) return
 
@@ -530,67 +559,73 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
       await exitIdleIfNeeded()
 
       await pushPresence()
-    },
+    }),
 
-    "tool.execute.before": async (input: ToolExecuteInput, output: ToolExecuteOutput) => {
-      if (shouldSkipSessionSync(input.sessionID)) return
+    "tool.execute.before": guard(
+      "tool.execute.before",
+      async (input: ToolExecuteInput, output: ToolExecuteOutput) => {
+        if (shouldSkipSessionSync(input.sessionID)) return
 
-      const toolName = input.tool ?? ""
-      const callID = input.callID ?? ""
-      const filePath = extractFilePathFromArgs(output.args)
-      const command = typeof output.args === "string" ? output.args : undefined
-      const operation = getToolLabel({ toolName, command })
+        const toolName = input.tool ?? ""
+        const callID = input.callID ?? ""
+        const filePath = extractFilePathFromArgs(output.args)
+        const command = typeof output.args === "string" ? output.args : undefined
+        const operation = getToolLabel({ toolName, command })
 
-      if (callID) {
-        callContext.set(callID, { filePath, operation })
-      }
+        if (callID) {
+          callContext.set(callID, { filePath, operation })
+        }
 
-      if (filePath) {
-        snapshot = presenceReducer(
-          snapshot,
-          updateFileAction({ file: filePath, action: toolName, operation }),
-        )
-        sessionMetricsState = recordFileTouch(sessionMetricsState, filePath)
-        await saveSessionMetrics(sessionMetricsState, undefined, { instanceId })
-      } else {
-        snapshot = presenceReducer(snapshot, updateFileAction({ action: toolName, operation }))
-      }
+        if (filePath) {
+          snapshot = presenceReducer(
+            snapshot,
+            updateFileAction({ file: filePath, action: toolName, operation }),
+          )
+          sessionMetricsState = recordFileTouch(sessionMetricsState, filePath)
+          await saveSessionMetrics(sessionMetricsState, undefined, { instanceId })
+        } else {
+          snapshot = presenceReducer(snapshot, updateFileAction({ action: toolName, operation }))
+        }
 
-      await exitIdleIfNeeded()
-      await pushPresence()
-    },
+        await exitIdleIfNeeded()
+        await pushPresence()
+      },
+    ),
 
-    "tool.execute.after": async (input: ToolExecuteInput, _output: ToolExecuteOutput) => {
-      if (shouldSkipSessionSync(input.sessionID)) return
+    "tool.execute.after": guard(
+      "tool.execute.after",
+      async (input: ToolExecuteInput, _output: ToolExecuteOutput) => {
+        if (shouldSkipSessionSync(input.sessionID)) return
 
-      const toolName = input.tool ?? ""
-      const callID = input.callID ?? ""
+        const toolName = input.tool ?? ""
+        const callID = input.callID ?? ""
 
-      const captured = callContext.get(callID)
-      const filePath = captured?.filePath
-      const operation = captured?.operation ?? getToolLabel({ toolName })
+        const captured = callContext.get(callID)
+        const filePath = captured?.filePath
+        const operation = captured?.operation ?? getToolLabel({ toolName })
 
-      if (callID) {
-        callContext.delete(callID)
-      }
+        if (callID) {
+          callContext.delete(callID)
+        }
 
-      if (filePath) {
-        snapshot = presenceReducer(
-          snapshot,
-          updateFileAction({ file: filePath, action: toolName, operation }),
-        )
-        sessionMetricsState = recordFileTouch(sessionMetricsState, filePath)
-        await saveSessionMetrics(sessionMetricsState, undefined, { instanceId })
-      } else {
-        snapshot = presenceReducer(snapshot, updateFileAction({ action: toolName, operation }))
-      }
+        if (filePath) {
+          snapshot = presenceReducer(
+            snapshot,
+            updateFileAction({ file: filePath, action: toolName, operation }),
+          )
+          sessionMetricsState = recordFileTouch(sessionMetricsState, filePath)
+          await saveSessionMetrics(sessionMetricsState, undefined, { instanceId })
+        } else {
+          snapshot = presenceReducer(snapshot, updateFileAction({ action: toolName, operation }))
+        }
 
-      await exitIdleIfNeeded()
-      await pushPresence()
-    },
+        await exitIdleIfNeeded()
+        await pushPresence()
+      },
+    ),
 
     // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: event dispatch pattern requires all branches
-    event: async ({ event }) => {
+    event: guard("event", async ({ event }) => {
       const eventType = event.type
 
       if (eventType === "session.created" || eventType === "session.updated") {
@@ -761,6 +796,6 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
           message: `Unhandled event type: ${eventType}`,
         },
       })
-    },
+    }),
   }
 }
