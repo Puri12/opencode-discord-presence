@@ -42,13 +42,24 @@ Register the plugin in your `opencode.json`:
 
 ```json
 {
-  "plugin": ["opencode-discord-presence"]
+  "plugins": ["opencode-discord-presence"]
 }
 ```
+
+> On OpenCode **V1**, use the legacy key instead: `{ "plugin": ["opencode-discord-presence"] }`.
 
 That's it! The plugin will automatically connect to Discord and display your session status.
 
 > `opencode.json` only **registers** the plugin. All plugin settings live in `.discord-presence.json` or environment variables — see [Configuration](#configuration) below.
+
+### OpenCode V2 support
+
+OpenCode **V2** changed the plugin API: a plugin's default export must be a definition object with an `id` and a `setup` function, and V1 hook objects are no longer executed. This package ships **both** APIs from a single build:
+
+- `dist/index.js` default export is `{ id, setup, server }` — `id` + `setup` satisfy the V2 contract, while `server` keeps the legacy V1 hook object working on OpenCode V1.
+- `server.js` is a thin bridge that re-exports `dist/index.js`, so directory-based plugin resolution on V2 (`<plugin-dir>/server`) works out of the box.
+
+No configuration change is required beyond the `plugins` key shown above; the presence engine, config file, and environment variables are identical on both versions. The V2 adapter translates V2 events (`session.*`, `file.edited`, tool hooks) into the same internal engine the V1 path uses, so behavior is consistent.
 
 ## Configuration
 
@@ -156,7 +167,8 @@ The plugin hooks into OpenCode's event system:
 
 ### Limitations
 
-- **lsp.client.diagnostics** is listened for, but error/warning counts are not available through the OpenCode plugin API v1. Diagnostic counts shown in presence require external LSP configuration. The plugin logs diagnostics events but does not fabricate counts.
+- **lsp.client.diagnostics** (V1) / **lsp.updated** (V2) is listened for, but error/warning counts are not available through the OpenCode plugin API. Diagnostic counts shown in presence require external LSP configuration. The plugin logs diagnostics events but does not fabricate counts.
+- **todo.updated** exists in the V1 plugin API but has no direct V2 event. On V2, the adapter derives mission-board todos from `todo`-shaped tool inputs (`ctx.tool.hook("execute.before")`) so the mission board keeps working.
 
 ### Presence States
 
@@ -221,8 +233,9 @@ bun run build
 
 ```
 src/
-├── index.ts              # Main entry point & exports
-├── plugin.ts             # OpenCode hook registration + presence engine
+├── index.ts              # Entry point: dual V1/V2 default export + re-exports
+├── v2.ts                 # OpenCode V2 adapter (Plugin.define, event/hook bridge)
+├── plugin.ts             # V1 hook registration + presence engine (shared core)
 ├── config.ts             # Configuration management
 ├── types/
 │   └── index.ts          # TypeScript type definitions
@@ -237,7 +250,11 @@ src/
     ├── session-metrics.ts   # Session counters + recap
     ├── tool-label.ts        # Tool → operation label mapping
     └── particle.ts          # Korean particle handling (을/를, 은/는)
+
+server.js                 # V2 directory-entrypoint bridge → dist/index.js
 ```
+
+The V2 adapter (`src/v2.ts`) intentionally reuses the V1 presence engine (`src/plugin.ts`) rather than forking it: it shims the V1 `client`, subscribes to `ctx.event` and translates V2 envelopes into the V1 `{ type, properties }` event shape, and maps V2 tool/session hooks onto the V1 handlers. This keeps a single source of truth for presence behavior across both OpenCode versions.
 
 ## Contributing
 

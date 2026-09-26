@@ -37,13 +37,24 @@ pnpm add opencode-discord-presence
 
 ```json
 {
-  "plugin": ["opencode-discord-presence"]
+  "plugins": ["opencode-discord-presence"]
 }
 ```
+
+> OpenCode **V1**에서는 기존 키를 사용하세요: `{ "plugin": ["opencode-discord-presence"] }`.
 
 끝! 플러그인이 자동으로 Discord에 연결되어 세션 상태를 표시합니다.
 
 > `opencode.json`은 플러그인을 **등록**하는 용도일 뿐, 플러그인 설정은 모두 `.discord-presence.json` 또는 환경변수로 관리합니다. 아래 [설정](#설정) 섹션 참고.
+
+### OpenCode V2 지원
+
+OpenCode **V2**에서는 플러그인 API가 변경되어, 플러그인의 기본 export가 `id`와 `setup` 함수를 가진 정의 객체여야 하며 V1 훅 객체는 더 이상 실행되지 않습니다. 이 패키지는 **하나의 빌드**에서 두 API를 모두 제공합니다:
+
+- `dist/index.js`의 기본 export는 `{ id, setup, server }`입니다. `id`와 `setup`이 V2 계약을 충족하고, `server`는 OpenCode V1에서 기존 V1 훅 객체를 그대로 동작시킵니다.
+- `server.js`는 `dist/index.js`를 재export하는 얇은 브릿지로, V2의 디렉토리 기반 플러그인 해석(`<plugin-dir>/server`)이 별도 설정 없이 동작합니다.
+
+위의 `plugins` 키 외에 추가 설정은 필요 없으며, presence 엔진·설정 파일·환경변수는 두 버전에서 동일합니다. V2 어댑터는 V2 이벤트(`session.*`, `file.edited`, tool 훅)를 V1 경로가 사용하는 것과 동일한 내부 엔진으로 변환하므로 동작이 일관됩니다.
 
 ## 설정
 
