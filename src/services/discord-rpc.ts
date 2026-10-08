@@ -9,6 +9,13 @@ const RECONNECT_JITTER_RATIO = 0.2
 const MAX_RETRIES = 10
 const DEBOUNCE_MS = 100
 export const MIN_UPDATE_GAP_MS = 2000
+/**
+ * Upper bound for a single awaited Discord IPC request (clearActivity, destroy).
+ * @xhayper/discord-rpc has no request timeout: if Discord never answers, the
+ * promise never settles and anything awaiting it (shutdown, ownership hand-off)
+ * hangs with it. See issue #13.
+ */
+export const REQUEST_TIMEOUT_MS = 2000
 const MAX_DETAILS_LENGTH = 126
 const MAX_STATE_LENGTH = 126
 
@@ -42,6 +49,8 @@ export function shouldLogConnectFailure(retryCount: number): boolean {
 
 export interface DiscordRPCOptions {
   debug?: boolean
+  /** Override REQUEST_TIMEOUT_MS (tests). */
+  requestTimeoutMs?: number
 }
 
 /**
@@ -65,6 +74,7 @@ export class DiscordRPCService {
   private sessionStart: Date = new Date()
   private currentPresence: SetActivity | null = null
   private readonly debug: boolean
+  private readonly requestTimeoutMs: number
 
   // ── Lifecycle flags ─────────────────────────────────────────────────────
   private cleared = false
@@ -96,6 +106,7 @@ export class DiscordRPCService {
     options: DiscordRPCOptions = {},
   ) {
     this.debug = options.debug ?? false
+    this.requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS
   }
 
   // ─── Test injection points ────────────────────────────────────────────
@@ -278,7 +289,7 @@ export class DiscordRPCService {
 
     if (client?.user && !alreadyCleared) {
       try {
-        await client.user.clearActivity()
+        await this.withTimeout(client.user.clearActivity(), "clearActivity")
       } catch (error) {
         this.warn("Failed to clear activity:", error)
       }
@@ -286,7 +297,7 @@ export class DiscordRPCService {
 
     if (client?.destroy) {
       try {
-        await client.destroy()
+        await this.withTimeout(client.destroy(), "destroy")
       } catch (error) {
         this.warn("Failed to destroy RPC client:", error)
       }
@@ -407,10 +418,27 @@ export class DiscordRPCService {
 
     if (!this.connected || !this.client?.user) return
     try {
-      await this.client.user.clearActivity()
+      await this.withTimeout(this.client.user.clearActivity(), "clearActivity")
     } catch (error) {
       this.warn("Failed to clear activity:", error)
     }
+  }
+
+  /**
+   * Resolves when `request` settles or after requestTimeoutMs, whichever comes
+   * first; rejects only if `request` rejects in time. The underlying request is
+   * left to settle on its own.
+   */
+  private withTimeout<T>(request: Promise<T>, label: string): Promise<T | undefined> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => {
+        this.warn(`${label} timed out after ${this.requestTimeoutMs}ms`)
+        resolve(undefined)
+      }, this.requestTimeoutMs)
+      timer.unref?.()
+    })
+    return Promise.race([request, timeout]).finally(() => clearTimeout(timer))
   }
 
   resetSessionStart(): void {

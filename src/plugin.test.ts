@@ -876,6 +876,39 @@ describe("OpenCodeDiscordPresence shutdown lifecycle", () => {
       expect(process.listenerCount("SIGTERM")).toBe(sigtermBefore)
     })
   })
+
+  test("SIGTERM still terminates the host process after cleanup", async () => {
+    await withTempPluginDirectory(async (directory) => {
+      const script = join(directory, "host.ts")
+      await Bun.write(
+        script,
+        [
+          `import { OpenCodeDiscordPresence } from ${JSON.stringify(join(import.meta.dir, "plugin.ts"))}`,
+          "await OpenCodeDiscordPresence({ directory: process.cwd(), client: { app: { log: () => {} }, session: { get: async () => ({ data: {} }) } } } as never)",
+          'console.log("READY")',
+          "setInterval(() => {}, 1000)",
+        ].join("\n"),
+      )
+      const child = Bun.spawn(["bun", script], {
+        cwd: directory,
+        env: { ...process.env, HOME: directory, XDG_RUNTIME_DIR: directory },
+        stdout: "pipe",
+        stderr: "ignore",
+      })
+      const reader = child.stdout.getReader()
+      const { value } = await reader.read()
+      expect(new TextDecoder().decode(value)).toContain("READY")
+
+      child.kill("SIGTERM")
+      const exited = await Promise.race([
+        child.exited.then(() => "exited"),
+        new Promise((resolve) => setTimeout(() => resolve("still running"), 5000)),
+      ])
+      if (exited !== "exited") child.kill("SIGKILL")
+      expect(exited).toBe("exited")
+      expect(child.signalCode).toBe("SIGTERM")
+    })
+  }, 15000)
 })
 
 describe("createOwnershipHandler", () => {

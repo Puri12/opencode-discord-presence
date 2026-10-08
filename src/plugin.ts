@@ -276,12 +276,18 @@ export const OpenCodeDiscordPresence: Plugin = async (ctx) => {
     await current.disconnect()
   }
 
-  const handleSigint = () => {
-    void shutdown().catch((error) => warnDebug("shutdown", error))
+  // Registering a signal listener replaces Node/Bun's default "exit on signal".
+  // After cleanup, re-raise the signal when nobody else is listening so the
+  // host still terminates instead of hanging on SIGINT/SIGTERM.
+  const shutdownThenReraise = (signal: NodeJS.Signals) => {
+    void shutdown()
+      .catch((error) => warnDebug("shutdown", error))
+      .finally(() => {
+        if (process.listenerCount(signal) === 0) process.kill(process.pid, signal)
+      })
   }
-  const handleSigterm = () => {
-    void shutdown().catch((error) => warnDebug("shutdown", error))
-  }
+  const handleSigint = () => shutdownThenReraise("SIGINT")
+  const handleSigterm = () => shutdownThenReraise("SIGTERM")
 
   process.on("SIGINT", handleSigint)
   process.on("SIGTERM", handleSigterm)
