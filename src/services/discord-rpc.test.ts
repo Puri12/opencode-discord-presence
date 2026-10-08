@@ -214,6 +214,49 @@ describe("DiscordRPCService", () => {
     })
   })
 
+  describe("Discord never replies (issue #13)", () => {
+    const never = () => new Promise<void>(() => {})
+    const hungClient = () => {
+      const client = createMockClient()
+      client.user.setActivity = () => never()
+      client.user.clearActivity = () => never()
+      client.destroy = () => never()
+      return client
+    }
+    const settles = (p: Promise<unknown>, ms: number) =>
+      Promise.race([
+        p.then(() => "settled"),
+        new Promise((resolve) => setTimeout(() => resolve("pending"), ms)),
+      ])
+
+    test("setPresence resolves without waiting for setActivity", async () => {
+      const rpc = new DiscordRPCService("123", { requestTimeoutMs: 20 })
+      // @ts-expect-error — test injection
+      rpc._overrideClient(hungClient())
+      rpc._setConnected(true)
+
+      expect(await settles(rpc.setPresence("Working", "model"), 200)).toBe("settled")
+    })
+
+    test("clear() gives up on clearActivity after the request timeout", async () => {
+      const rpc = new DiscordRPCService("123", { requestTimeoutMs: 20 })
+      // @ts-expect-error — test injection
+      rpc._overrideClient(hungClient())
+      rpc._setConnected(true)
+
+      expect(await settles(rpc.clear(), 500)).toBe("settled")
+    })
+
+    test("disconnect() gives up on clearActivity and destroy after the request timeout", async () => {
+      const rpc = new DiscordRPCService("123", { requestTimeoutMs: 20 })
+      // @ts-expect-error — test injection
+      rpc._overrideClient(hungClient())
+      rpc._setConnected(true)
+
+      expect(await settles(rpc.disconnect(), 500)).toBe("settled")
+    })
+  })
+
   describe("setPresence debounce", () => {
     test("multiple rapid setPresence calls schedule only one debounced flush", () => {
       const timers = new Map<number, () => void>()
