@@ -258,3 +258,71 @@ describe("getConfig", () => {
     expect(config.richPresence.enableFileSpotlight).toBe(true)
   })
 })
+
+describe("getConfig — type validation of untrusted JSON values", () => {
+  const saved: Record<string, string | undefined> = {}
+
+  beforeEach(() => {
+    for (const k of ENV_KEYS) {
+      saved[k] = process.env[k]
+      delete process.env[k]
+    }
+  })
+
+  afterEach(() => {
+    for (const k of ENV_KEYS) {
+      if (saved[k] === undefined) delete process.env[k]
+      else process.env[k] = saved[k]
+    }
+  })
+
+  test("string 'yes' for enabled coerces to default true (not truthy garbage)", () => {
+    const config = getConfig({ enabled: "yes" } as unknown as Parameters<typeof getConfig>[0])
+    expect(config.enabled).toBe(true)
+  })
+
+  test("string 'false' for enabled is NOT boolean false — falls back to default true", () => {
+    const config = getConfig({ enabled: "false" } as unknown as Parameters<typeof getConfig>[0])
+    expect(config.enabled).toBe(true)
+  })
+
+  test("boolean false for enabled is honored", () => {
+    const config = getConfig({ enabled: false })
+    expect(config.enabled).toBe(false)
+  })
+
+  test("numeric applicationId falls back to default client id", () => {
+    const config = getConfig({ applicationId: 12345 } as unknown as Parameters<typeof getConfig>[0])
+    expect(config.clientId).toBe(DEFAULT_CLIENT_ID)
+  })
+
+  test("non-string language falls back to en", () => {
+    const config = getConfig({ language: 42 } as unknown as Parameters<typeof getConfig>[0])
+    expect(config.language).toBe("en")
+  })
+
+  test("string debug value falls back to default false", () => {
+    const config = getConfig({ debug: "true" } as unknown as Parameters<typeof getConfig>[0])
+    expect(config.debug).toBe(false)
+  })
+
+  test("non-boolean richPresence flags fall back to safe defaults", () => {
+    const config = getConfig({
+      richPresence: {
+        enableFileSpotlight: "on",
+        enableMissionBoard: 1,
+        mainAgentOnly: "yes",
+      },
+    } as unknown as Parameters<typeof getConfig>[0])
+    expect(config.richPresence.enableFileSpotlight).toBe(false)
+    expect(config.richPresence.enableMissionBoard).toBe(true)
+    expect(config.richPresence.mainAgentOnly).toBe(false)
+  })
+
+  test("rotationIntervalSeconds string is rejected → default", () => {
+    const config = getConfig({
+      richPresence: { rotationIntervalSeconds: "15" },
+    } as unknown as Parameters<typeof getConfig>[0])
+    expect(config.richPresence.rotationIntervalSeconds).toBe(20)
+  })
+})

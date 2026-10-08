@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import type { PresenceSnapshot } from "../state/presence-state"
 import { createInitialPresenceState } from "../state/presence-state"
 import type { RichPresenceOptions } from "../types/index.js"
-import { getActivity, resolveRotatingCard } from "./activity-rotation"
+import { buildRotatingCards, getActivity, resolveRotatingCard } from "./activity-rotation"
 
 function makeState(overrides: Partial<PresenceSnapshot> = {}): PresenceSnapshot {
   const base = createInitialPresenceState()
@@ -935,5 +935,54 @@ describe("getActivity — model name visibility", () => {
   test("largeImageText on session-stats card falls back to plain label when no model", () => {
     const activity = getActivity(stateWith(""), defaultOpts(), 2)
     expect(activity.assets?.largeImageText).toBe("Session Stats")
+  })
+})
+
+describe("buildRotatingCards — single source of truth for card set", () => {
+  test("default options yield mission-board + session-stats", () => {
+    const opts = { ...defaultOpts(), enableFileSpotlight: false }
+    expect(buildRotatingCards(opts, false, 0)).toEqual(["task-mission-board", "session-stats"])
+  })
+
+  test("all features on with warnings yields all four cards", () => {
+    expect(buildRotatingCards(defaultOpts(), true, 0)).toEqual([
+      "file-spotlight",
+      "task-mission-board",
+      "diagnostics-warnings",
+      "session-stats",
+    ])
+  })
+
+  test("warnings card excluded when errors present", () => {
+    expect(buildRotatingCards(defaultOpts(), true, 2)).not.toContain("diagnostics-warnings")
+  })
+
+  test("everything disabled still yields session-stats fallback (length >= 1)", () => {
+    const opts = { ...defaultOpts(), enableFileSpotlight: false, enableMissionBoard: false }
+    expect(buildRotatingCards(opts, false, 0)).toEqual(["session-stats"])
+  })
+
+  test("resolveRotatingCard agrees with buildRotatingCards across permutations", () => {
+    const bools = [true, false]
+    const permutations = bools.flatMap((spotlight) =>
+      bools.flatMap((board) =>
+        bools.flatMap((hasWarnings) =>
+          [0, 3].map((errors) => ({ spotlight, board, hasWarnings, errors })),
+        ),
+      ),
+    )
+
+    for (const { spotlight, board, hasWarnings, errors } of permutations) {
+      const opts = {
+        ...defaultOpts(),
+        enableFileSpotlight: spotlight,
+        enableMissionBoard: board,
+      }
+      const cards = buildRotatingCards(opts, hasWarnings, errors)
+      expect(cards.length).toBeGreaterThanOrEqual(1)
+      for (let i = 0; i < cards.length * 2; i++) {
+        expect(resolveRotatingCard(i, opts, hasWarnings, errors)).toBe(cards[i % cards.length])
+      }
+    }
   })
 })

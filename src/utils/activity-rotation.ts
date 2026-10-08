@@ -98,6 +98,26 @@ export type RotatingCard =
   | "session-stats"
 
 /**
+ * Builds the ordered list of rotating informational cards for the current
+ * feature flags and diagnostics state. Single source of truth shared by the
+ * renderer (resolveRotatingCard) and the plugin's rotation-index modulus —
+ * keeping both derived from one list prevents index/card drift.
+ */
+export function buildRotatingCards(
+  opts: RichPresenceOptions,
+  hasWarnings: boolean,
+  errors: number,
+): RotatingCard[] {
+  const cards: RotatingCard[] = []
+  if (opts.enableFileSpotlight) cards.push("file-spotlight")
+  if (opts.enableMissionBoard) cards.push("task-mission-board")
+  // Warnings rotating card only participates when warnings are present and no errors
+  if (hasWarnings && errors === 0) cards.push("diagnostics-warnings")
+  cards.push("session-stats") // stats are always present as ultimate fallback
+  return cards
+}
+
+/**
  * Maps a rotation index to a RotatingCard, honouring enabled/disabled features
  * and whether the warnings rotating card is relevant (warnings > 0 && errors = 0).
  * Returns null when all rotating cards are disabled.
@@ -108,13 +128,7 @@ export function resolveRotatingCard(
   hasWarnings: boolean,
   errors: number,
 ): RotatingCard | null {
-  const cards: RotatingCard[] = []
-  if (opts.enableFileSpotlight) cards.push("file-spotlight")
-  if (opts.enableMissionBoard) cards.push("task-mission-board")
-  // Warnings rotating card only participates when warnings are present and no errors
-  if (hasWarnings && errors === 0) cards.push("diagnostics-warnings")
-  cards.push("session-stats") // stats are always present as ultimate fallback
-
+  const cards = buildRotatingCards(opts, hasWarnings, errors)
   if (cards.length === 0) return null
   return cards[index % cards.length]
 }

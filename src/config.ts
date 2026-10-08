@@ -61,13 +61,13 @@ function parseRichPresenceOptions(raw?: Partial<RichPresenceOptions>): RichPrese
     }
   }
   return {
-    enableFileSpotlight: raw.enableFileSpotlight ?? false,
-    enableMissionBoard: raw.enableMissionBoard ?? true,
+    enableFileSpotlight: asBoolean(raw.enableFileSpotlight) ?? false,
+    enableMissionBoard: asBoolean(raw.enableMissionBoard) ?? true,
     rotationIntervalSeconds: parseRotationInterval(raw.rotationIntervalSeconds),
     diagnostics: {
-      errorsOnly: raw.diagnostics?.errorsOnly ?? true,
+      errorsOnly: asBoolean(raw.diagnostics?.errorsOnly) ?? true,
     },
-    mainAgentOnly: raw.mainAgentOnly ?? false,
+    mainAgentOnly: asBoolean(raw.mainAgentOnly) ?? false,
   }
 }
 
@@ -79,6 +79,14 @@ function parseBool(value: string | undefined): boolean | undefined {
   return undefined
 }
 
+function asBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined
+}
+
 export function getConfig(options?: DiscordPresenceOptions): PresenceConfig {
   const compatibleOptions = options as CompatibleDiscordPresenceOptions | undefined
   const envEnabled = process.env.OPENCODE_DISCORD_ENABLED
@@ -87,14 +95,14 @@ export function getConfig(options?: DiscordPresenceOptions): PresenceConfig {
   const envDebug = process.env.OPENCODE_DISCORD_DEBUG
 
   return {
-    enabled: options?.enabled ?? envEnabled !== "false",
+    enabled: asBoolean(options?.enabled) ?? envEnabled !== "false",
     clientId:
-      compatibleOptions?.applicationId ??
-      compatibleOptions?.discordPresence?.applicationId ??
+      asString(compatibleOptions?.applicationId) ??
+      asString(compatibleOptions?.discordPresence?.applicationId) ??
       envClientId ??
       DEFAULT_CLIENT_ID,
-    language: parseLanguage(options?.language ?? envLanguage),
+    language: parseLanguage(asString(options?.language) ?? envLanguage),
     richPresence: parseRichPresenceOptions(options?.richPresence),
-    debug: options?.debug ?? parseBool(envDebug) ?? false,
+    debug: asBoolean(options?.debug) ?? parseBool(envDebug) ?? false,
   }
 }

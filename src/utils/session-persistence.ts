@@ -1,5 +1,5 @@
 import { mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs"
-import { readFile, writeFile } from "node:fs/promises"
+import { readFile, rename, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
@@ -53,7 +53,11 @@ export async function saveSessionMetrics(
   const baseDir = dir ?? join(homedir(), SESSION_DIR)
   const filePath = resolveFile(baseDir, options)
 
-  ensureDir(baseDir)
+  try {
+    ensureDir(baseDir)
+  } catch {
+    return
+  }
 
   const serialized: PersistenceSessionMetrics = {
     messageCount: metrics.messageCount,
@@ -66,7 +70,15 @@ export async function saveSessionMetrics(
   }
 
   const json = JSON.stringify(serialized)
-  await writeFile(filePath, json)
+  const tmpPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`
+  try {
+    await writeFile(tmpPath, json)
+    await rename(tmpPath, filePath)
+  } catch {
+    try {
+      unlinkSync(tmpPath)
+    } catch {}
+  }
 }
 
 export async function loadSessionMetrics(
@@ -161,6 +173,7 @@ function readEntriesSafe(baseDir: string): string[] {
 }
 
 function isPruneCandidate(name: string, keepInstanceId?: string): boolean {
+  if (name === LEGACY_SESSION_FILE) return true
   if (!name.startsWith(PER_INSTANCE_PREFIX) || !name.endsWith(PER_INSTANCE_SUFFIX)) return false
   if (!keepInstanceId) return true
   const instanceId = name.slice(PER_INSTANCE_PREFIX.length, -PER_INSTANCE_SUFFIX.length)
